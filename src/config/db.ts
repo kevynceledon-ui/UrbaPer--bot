@@ -10,9 +10,14 @@ import {
 } from "sequelize";
 
 //Conexión db
+if (!process.env.DB_URL) {
+  console.error("Falta la variable de entorno DB_URL (connection string de Postgres).");
+  process.exit(1);
+}
+
 //Proveedores gestionados (Neon, Supabase, etc.) exigen SSL; Sequelize no lo activa
 //solo por tener "sslmode=require" en la URL, hay que declararlo en dialectOptions.
-const sequelize = new Sequelize(process.env.DB_URL as string, {
+const sequelize = new Sequelize(process.env.DB_URL, {
   logging: false,
   dialectOptions:
     process.env.NODE_ENV === "production"
