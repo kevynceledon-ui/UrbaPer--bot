@@ -10,8 +10,14 @@ import {
 } from "sequelize";
 
 //Conexión db
+//Proveedores gestionados (Neon, Supabase, etc.) exigen SSL; Sequelize no lo activa
+//solo por tener "sslmode=require" en la URL, hay que declararlo en dialectOptions.
 const sequelize = new Sequelize(process.env.DB_URL as string, {
   logging: false,
+  dialectOptions:
+    process.env.NODE_ENV === "production"
+      ? { ssl: { require: true, rejectUnauthorized: false } }
+      : {},
 });
 
 type EstadoPedido = "comprando" | "pendiente" | "preparando" | "listo" | "entregado" | "cancelado";
