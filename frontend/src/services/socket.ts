@@ -1,16 +1,24 @@
 import { io, Socket } from 'socket.io-client'
 
 function resolveApiUrl(): string {
-  const envUrl = (import.meta.env.VITE_API_URL as string | undefined) ?? 'http://localhost:3000'
-  try {
-    if (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+  const envUrl = import.meta.env.VITE_API_URL as string | undefined
+
+  if (!envUrl) {
+    if (import.meta.env.DEV) return 'http://localhost:3000'
+    console.error('VITE_API_URL no está definida en este build de producción.')
+    return ''
+  }
+
+  // Solo en dev local (ver services/api.ts para el detalle del porqué).
+  if (import.meta.env.DEV && typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    try {
       const u = new URL(envUrl)
       if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') {
         u.hostname = window.location.hostname
         return u.toString().replace(/\/$/, '')
       }
-    }
-  } catch { /* ignore */ }
+    } catch { /* ignore */ }
+  }
   return envUrl
 }
 const API_URL = resolveApiUrl()
