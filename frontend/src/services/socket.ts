@@ -26,14 +26,16 @@ const API_URL = resolveApiUrl()
 let socket: Socket | null = null
 
 export function getSocket(token: string): Socket {
-  // Si ya existe y tiene mismo token, reutilizar
-  if (socket?.connected) return socket
-
-  // Desconectar previo si existe
-  if (socket) {
-    socket.disconnect()
-    socket = null
-  }
+  // Reutiliza la instancia existente aunque todavía no haya terminado de conectar:
+  // el dashboard llama a getSocket() desde varios hooks (useOrdersSocket,
+  // useWhatsappStatus, useClientesEsperando) casi en el mismo instante al montar.
+  // Antes se comparaba socket.connected, que en un socket recién creado sigue en
+  // false por unos milisegundos (el handshake es async) — cada hook posterior
+  // desconectaba el socket del hook anterior y creaba uno nuevo, dejando a los
+  // primeros escuchando eventos en un socket ya muerto. Socket.IO encola los
+  // listeners y los emits sin problema aunque el handshake no haya terminado, así
+  // que no hace falta esperar a "connected" para reutilizar la instancia.
+  if (socket) return socket
 
   socket = io(API_URL, {
     auth: { token: `Bearer ${token}` },
