@@ -57,6 +57,13 @@ async function manejarMensaje(
     return;
   }
 
+  //Cliente atendido por una persona: el bot se queda callado para no interrumpir
+  //la conversación manual hasta que alguien del equipo lo devuelva al bot desde
+  //el dashboard.
+  if (estadosUsuarios[numeroTelefono] === "HABLANDO_CON_HUMANO") {
+    return;
+  }
+
   try {
     // 1. ¿ESTAMOS ESPERANDO EL NOMBRE?
     if (estadosUsuarios[numeroTelefono] === "ESPERANDO_NOMBRE") {
@@ -110,7 +117,18 @@ async function manejarMensaje(
     }
 
     if (textoCliente === "2" && estadosUsuarios[numeroTelefono] !== "REALIZANDO_PEDIDO") {
-      delete estadosUsuarios[numeroTelefono];
+      estadosUsuarios[numeroTelefono] = "HABLANDO_CON_HUMANO";
+      delete carritos[numeroTelefono];
+
+      const desde = new Date();
+      await Cliente.update({ necesitaHumanoDesde: desde }, { where: { telefono: numeroTelefono } });
+
+      void emitirEvento("cliente_necesita_humano", {
+        telefono: numeroTelefono,
+        nombre: cliente.nombre,
+        desde: desde.toISOString(),
+      });
+
       await responder("👨‍🍳 ¡Entendido! Un miembro de nuestro equipo leerá tu mensaje y te atenderá en unos minutos. ¡Gracias por tu paciencia!");
       return;
     }
@@ -245,6 +263,12 @@ async function emitirEvento(evento: string, payload?: unknown): Promise<void> {
   } catch (e) {
     console.warn(`[Socket.IO] No se pudo emitir ${evento}:`, e instanceof Error ? e.message : e);
   }
+}
+
+//Usado por PATCH /api/clientes/:telefono/reanudar-bot cuando el equipo termina de
+//atender manualmente y quiere que el bot vuelva a responder ese número.
+export function reanudarBot(numeroTelefono: string): void {
+  delete estadosUsuarios[numeroTelefono];
 }
 
 //Evita que dos conexiones convivan a la vez usando la misma sesión (corrompe el

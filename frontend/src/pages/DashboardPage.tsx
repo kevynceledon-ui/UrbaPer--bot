@@ -2,11 +2,13 @@ import { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Header } from '../components/Header'
 import { OrderCard } from '../components/OrderCard'
+import { ClienteEsperandoCard } from '../components/ClienteEsperandoCard'
 import { StartShiftButton } from '../components/StartShiftButton'
 import { useWakeLock } from '../hooks/useWakeLock'
 import { useAudioUnlock } from '../hooks/useAudioUnlock'
 import { useOrdersSocket } from '../hooks/useOrdersSocket'
 import { useWhatsappStatus } from '../hooks/useWhatsappStatus'
+import { useClientesEsperando } from '../hooks/useClientesEsperando'
 import { playNotificationSound } from '../utils/audio'
 import { verifyToken } from '../services/api'
 import { disconnectSocket } from '../services/socket'
@@ -29,6 +31,7 @@ export function DashboardPage() {
   // Socket solo si hay token
   const { orders, lastOrder, connectionState, removeOrder, disconnect } = useOrdersSocket(token, audioUnlocked)
   const { qr: whatsappQr } = useWhatsappStatus(token)
+  const { clientes: clientesEsperando, devolverAlBot } = useClientesEsperando(token)
   const [highlightId, setHighlightId] = useState<string | number | null>(null)
 
   // Resalta la tarjeta del último pedido real recibido por socket ("¡NUEVO!")
@@ -139,6 +142,18 @@ export function DashboardPage() {
               className="mx-auto mt-4 h-56 w-56 rounded-2xl border border-zinc-800 bg-white p-2"
             />
             <p className="mt-3 text-xs text-zinc-500">El código expira solo; si se ve viejo, espera a que llegue uno nuevo.</p>
+          </div>
+        )}
+
+        {/* Clientes esperando atención humana: el bot está pausado para ellos */}
+        {clientesEsperando.length > 0 && (
+          <div className="mb-4 space-y-2" aria-live="polite">
+            <h2 className="text-[11px] font-bold tracking-[0.18em] text-brand-300 uppercase">
+              Esperando atención · {clientesEsperando.length}
+            </h2>
+            {clientesEsperando.map((c) => (
+              <ClienteEsperandoCard key={c.telefono} cliente={c} onDevolver={devolverAlBot} />
+            ))}
           </div>
         )}
 

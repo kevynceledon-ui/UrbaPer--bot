@@ -85,3 +85,26 @@ export async function marcarPedidoEntregado(id: string | number, token: string):
     throw new Error(data.error ?? 'No se pudo actualizar el pedido')
   }
 }
+
+//Clientes que pidieron hablar con una persona y el bot todavía tiene pausado.
+export async function getClientesEsperando(token: string): Promise<import('../types/order').ClienteEsperando[]> {
+  const res = await fetch(`${API_URL}/api/clientes/necesitan-humano`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  const data = await res.json()
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error ?? 'No se pudo cargar la lista')
+  }
+  return data.clientes
+}
+
+export async function reanudarBot(telefono: string, token: string): Promise<void> {
+  const res = await fetch(`${API_URL}/api/clientes/${telefono}/reanudar-bot`, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  const data = await res.json()
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error ?? 'No se pudo devolver el bot')
+  }
+}

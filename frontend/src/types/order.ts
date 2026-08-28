@@ -20,3 +20,9 @@ export interface Order {
 }
 
 export type NuevoPedidoPayload = Order
+
+export interface ClienteEsperando {
+  telefono: string
+  nombre: string
+  desde: string // ISO string
+}

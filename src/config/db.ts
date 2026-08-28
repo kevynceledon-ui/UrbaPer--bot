@@ -33,6 +33,11 @@ class Cliente extends Model<InferAttributes<Cliente>, InferCreationAttributes<Cl
   declare id: CreationOptional<string>;
   declare telefono: string;
   declare nombre: string;
+  //Marca de tiempo desde que el cliente pidió hablar con una persona (null = el bot
+  //lo atiende normal). Solo para que el dashboard lo muestre tras recargar la página;
+  //el bot en sí se pausa vía estado en memoria (ver whatsappServices.ts), que se
+  //pierde en cada reinicio del proceso igual que el resto del estado de conversación.
+  declare necesitaHumanoDesde: CreationOptional<Date | null>;
 }
 
 Cliente.init(
@@ -50,6 +55,11 @@ Cliente.init(
     nombre: {
       type: DataTypes.STRING,
       allowNull: false,
+    },
+    necesitaHumanoDesde: {
+      type: DataTypes.DATE,
+      allowNull: true,
+      defaultValue: null,
     },
   },
   { sequelize, modelName: "Cliente" }
