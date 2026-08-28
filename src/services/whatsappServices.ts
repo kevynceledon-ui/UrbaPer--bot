@@ -1,5 +1,10 @@
-import { Client, LocalAuth, Message } from "whatsapp-web.js";
-import qrcode from "qrcode-terminal";
+import makeWASocket, {
+  useMultiFileAuthState,
+  DisconnectReason,
+  type WAMessage,
+} from "@whiskeysockets/baileys";
+import { Boom } from "@hapi/boom";
+import pino from "pino";
 import QRCode from "qrcode";
 
 //Memoria temporal.
@@ -35,93 +40,21 @@ function generarMenuTexto(): string {
   return `*--- MENÚ URBANPERÚ 🇵🇪 ---*\n\n${lineas.join("\n")}\n\n👉 *Escribe el número del plato que deseas agregar a tu pedido (ej: 11).*`;
 }
 
-//Inicio del cliente
-//Localauth es vital para guardar la sesión en una carpeta oculta.
-//Esto para no escanear el qr cuando se reinicia el bot.
-//Flags de Puppeteer requeridos para correr Chromium dentro de un contenedor Docker
-//(sin sandbox de kernel disponible) como en Render. PUPPETEER_EXECUTABLE_PATH apunta
-//al Chromium instalado vía apt en la imagen Docker (ver Dockerfile) en vez del que
-//Puppeteer intenta descargar en npm install.
-const client = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: {
-    headless: true,
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      // Recorte de memoria para correr Chromium en los 512MB del plan free de Render:
-      // apaga extensiones, background sync, telemetría y otras cosas que no usamos.
-      "--disable-extensions",
-      "--disable-background-networking",
-      "--disable-background-timer-throttling",
-      "--disable-backgrounding-occluded-windows",
-      "--disable-breakpad",
-      "--disable-component-update",
-      "--disable-default-apps",
-      "--disable-sync",
-      "--disable-translate",
-      "--metrics-recording-only",
-      "--mute-audio",
-      "--no-first-run",
-      "--safebrowsing-disable-auto-update",
-      "--js-flags=--max-old-space-size=128",
-    ],
-  },
-});
+//Logger silencioso: Baileys es muy verboso por defecto (loguea cada paquete de protocolo).
+const logger = pino({ level: "error" });
 
-//Cuando el bot necesite vinculo arrojara el qr en consola.
-//El log en vivo de Render distorsiona el QR ASCII (fuente no monoespaciada), así que
-//además lo mandamos como imagen por el socket ya autenticado con JWT para que el
-//dashboard lo muestre y se pueda escanear desde el celular sin pasar por Render.
-client.on("qr", (qr) => {
-  qrcode.generate(qr, { small: true });
-  console.log("Escanea este código QR en el wsp del negocio (o desde el dashboard)");
-
-  QRCode.toDataURL(qr)
-    .then(async (dataUrl) => {
-      const { getIO } = await import("../config/socket.js");
-      try {
-        getIO().emit("whatsapp_qr", { qr: dataUrl });
-      } catch (e) {
-        console.warn("[Socket.IO] No se pudo emitir whatsapp_qr:", e instanceof Error ? e.message : e);
-      }
-    })
-    .catch((e) => console.error("Error generando QR como imagen:", e));
-});
-
-//Evento de éxito
-client.on("ready", async () => {
-  console.log("Cliente de wsp conecta y listo para recibir pedidos.");
-  const { getIO } = await import("../config/socket.js");
-  try {
-    getIO().emit("whatsapp_ready");
-  } catch (e) {
-    console.warn("[Socket.IO] No se pudo emitir whatsapp_ready:", e instanceof Error ? e.message : e);
-  }
-});
-
-//el bot escucha todo lo que llega
-client.on("message", async (msg: Message) => {
-  console.log(`[DEBUG CRUDO] De: ${msg.from} | Texto: "${msg.body}"| EsMio:"${msg.fromMe}"`);
-  //Si el mensaje no tiene texto , lo ignora de inmediato
-  //Esto elimina la basura de sincronización multimedia.
-  if (!msg.body || msg.body.trim() === "") return;
-  //Esto ignora mensajes de grupos, estados o sistema. Solo acepta chats privados.
-  if (msg.from.endsWith("@g.us") || msg.from === "status@broadcast") return;
-  //Ignorar si el mensaje viene de mi mismo.
-  if (msg.fromMe) return;
-
-  //Limpieza de el numero , quitara el "@c.us"
-  const numeroTelefono = msg.from.split("@")[0];
-  const textoCliente = msg.body.trim();
-
+//Procesa un mensaje entrante. Recibe un helper `responder` en vez de msg.reply()
+//(que no existe en Baileys) para mantener el resto de la lógica casi intacta.
+async function manejarMensaje(
+  numeroTelefono: string,
+  textoCliente: string,
+  responder: (texto: string) => Promise<unknown>
+): Promise<void> {
   if (textoCliente.toLowerCase() === "reset") {
     await Cliente.destroy({ where: { telefono: numeroTelefono } });
     delete estadosUsuarios[numeroTelefono];
-    return msg.reply("Tu usuario a sido eliminado.");
+    await responder("Tu usuario a sido eliminado.");
+    return;
   }
 
   try {
@@ -130,7 +63,8 @@ client.on("message", async (msg: Message) => {
       const soloLetras = /^[A-Za-zÁÉÍÓÚáéíóúÑñ]+$/;
 
       if (!soloLetras.test(textoCliente)) {
-        return msg.reply("❌ Formato inválido. Por favor, ingresa *solamente tu primer nombre* (sin espacios, ni números).");
+        await responder("❌ Formato inválido. Por favor, ingresa *solamente tu primer nombre* (sin espacios, ni números).");
+        return;
       }
 
       await Cliente.update(
@@ -139,7 +73,8 @@ client.on("message", async (msg: Message) => {
       );
 
       delete estadosUsuarios[numeroTelefono];
-      return msg.reply(`¡Perfecto, ${textoCliente}! Ya guardé tus datos. 🍔 ¿Qué te gustaría pedir hoy?\n\n1️⃣ Ver Menú\n2️⃣ Hablar con un humano`);
+      await responder(`¡Perfecto, ${textoCliente}! Ya guardé tus datos. 🍔 ¿Qué te gustaría pedir hoy?\n\n1️⃣ Ver Menú\n2️⃣ Hablar con un humano`);
+      return;
     }
 
     // 2. BUSCAR/CREAR AL CLIENTE EN LA BD
@@ -159,22 +94,25 @@ client.on("message", async (msg: Message) => {
     if (textoCliente.toLowerCase() === "hola") {
       if (fueCreado || !cliente.nombre || cliente.nombre.trim() === "Por definir") {
         estadosUsuarios[numeroTelefono] = "ESPERANDO_NOMBRE";
-        return msg.reply("¡Hola! Soy el asistente virtual de UrbanPerú 🇵🇪. Veo que es tu primera vez pidiendo con nosotros. ¿Me podrías decir tu nombre para registrarte?");
+        await responder("¡Hola! Soy el asistente virtual de UrbanPerú 🇵🇪. Veo que es tu primera vez pidiendo con nosotros. ¿Me podrías decir tu nombre para registrarte?");
       } else {
-        return msg.reply(`¡Hola de nuevo, ${cliente.nombre}! 🇵🇪 ¿Qué vas a servirte hoy?\n\n1️⃣ Ver Menú\n2️⃣ Hablar con un humano`);
+        await responder(`¡Hola de nuevo, ${cliente.nombre}! 🇵🇪 ¿Qué vas a servirte hoy?\n\n1️⃣ Ver Menú\n2️⃣ Hablar con un humano`);
       }
+      return;
     }
 
     // 4. ENRUTADOR PRINCIPAL (OPCIÓN 1 y 2)
     // Solo respondemos al 1 y 2 si NO están dentro de un pedido
     if (textoCliente === "1" && estadosUsuarios[numeroTelefono] !== "REALIZANDO_PEDIDO") {
       estadosUsuarios[numeroTelefono] = "REALIZANDO_PEDIDO";
-      return msg.reply(generarMenuTexto());
+      await responder(generarMenuTexto());
+      return;
     }
 
     if (textoCliente === "2" && estadosUsuarios[numeroTelefono] !== "REALIZANDO_PEDIDO") {
       delete estadosUsuarios[numeroTelefono];
-      return msg.reply("👨‍🍳 ¡Entendido! Un miembro de nuestro equipo leerá tu mensaje y te atenderá en unos minutos. ¡Gracias por tu paciencia!");
+      await responder("👨‍🍳 ¡Entendido! Un miembro de nuestro equipo leerá tu mensaje y te atenderá en unos minutos. ¡Gracias por tu paciencia!");
+      return;
     }
 
     // 5. LÓGICA DEL CARRITO (SOLO si el estado es REALIZANDO_PEDIDO)
@@ -184,7 +122,8 @@ client.on("message", async (msg: Message) => {
         const miCarrito = carritos[numeroTelefono];
 
         if (!miCarrito || miCarrito.length === 0) {
-          return msg.reply("Tu carrito está vacío. Por favor escribe un código válido (ej: 11).");
+          await responder("Tu carrito está vacío. Por favor escribe un código válido (ej: 11).");
+          return;
         }
 
         // Cálculo total y boleta
@@ -242,7 +181,7 @@ client.on("message", async (msg: Message) => {
             cliente: {
               telefono: numeroTelefono,
               nombre: cliente.nombre,
-              whatsapp: msg.from,
+              whatsapp: `${numeroTelefono}@s.whatsapp.net`,
             },
             items: [...miCarrito],
             total,
@@ -269,7 +208,8 @@ client.on("message", async (msg: Message) => {
         delete estadosUsuarios[numeroTelefono];
         delete carritos[numeroTelefono];
 
-        return msg.reply(resumen);
+        await responder(resumen);
+        return;
       }
 
       // b) Si el cliente ingresa un plato
@@ -280,17 +220,106 @@ client.on("message", async (msg: Message) => {
           carritos[numeroTelefono] = [];
         }
         carritos[numeroTelefono].push(productoElegido);
-        return msg.reply(`✅ *${productoElegido.nombre}* agregado a tu pedido.\n\n👉 Escribe otro código si quieres pedir algo más, o escribe *pagar* para enviar tu pedido a la cocina.`);
+        await responder(`✅ *${productoElegido.nombre}* agregado a tu pedido.\n\n👉 Escribe otro código si quieres pedir algo más, o escribe *pagar* para enviar tu pedido a la cocina.`);
       } else {
-        return msg.reply("❌ Código no reconocido. Por favor, escribe un número válido del menú (ej: 11) o escribe *pagar* para terminar.");
+        await responder("❌ Código no reconocido. Por favor, escribe un número válido del menú (ej: 11) o escribe *pagar* para terminar.");
       }
     }
-
-    return;
   } catch (error) {
     console.error("Error al intentar interactuar con la db", error);
-    return;
   }
-});
+}
 
-export default client;
+function extraerTexto(msg: WAMessage): string | undefined {
+  return msg.message?.conversation ?? msg.message?.extendedTextMessage?.text ?? undefined;
+}
+
+async function emitirEvento(evento: string, payload?: unknown): Promise<void> {
+  try {
+    const { getIO } = await import("../config/socket.js");
+    if (payload === undefined) {
+      getIO().emit(evento);
+    } else {
+      getIO().emit(evento, payload);
+    }
+  } catch (e) {
+    console.warn(`[Socket.IO] No se pudo emitir ${evento}:`, e instanceof Error ? e.message : e);
+  }
+}
+
+//Inicia (o reinicia) la conexión con WhatsApp. Baileys guarda las credenciales en
+//".baileys_auth" para no tener que re-escanear el QR en cada reinicio del proceso
+//(en el free tier de Render, sin disco persistente, igual se pierde en cada redeploy).
+export async function iniciarWhatsapp(): Promise<void> {
+  const { state, saveCreds } = await useMultiFileAuthState(".baileys_auth");
+
+  const sock = makeWASocket({
+    auth: state,
+    logger,
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    //El log en vivo de Render distorsiona el QR ASCII (fuente no monoespaciada), así que
+    //lo mandamos como imagen por el socket ya autenticado con JWT para que el dashboard
+    //lo muestre y se pueda escanear desde el celular sin pasar por la consola de Render.
+    if (qr) {
+      console.log("Nuevo QR generado, escanéalo desde el dashboard.");
+      QRCode.toDataURL(qr)
+        .then((dataUrl) => emitirEvento("whatsapp_qr", { qr: dataUrl }))
+        .catch((e) => console.error("Error generando QR como imagen:", e));
+    }
+
+    if (connection === "open") {
+      console.log("Cliente de wsp conecta y listo para recibir pedidos.");
+      void emitirEvento("whatsapp_ready");
+    }
+
+    if (connection === "close") {
+      const statusCode = lastDisconnect?.error instanceof Boom
+        ? lastDisconnect.error.output?.statusCode
+        : undefined;
+      const cerroSesion = statusCode === DisconnectReason.loggedOut;
+
+      console.error("Conexión de WhatsApp cerrada.", lastDisconnect?.error?.message ?? "");
+
+      if (cerroSesion) {
+        console.error("Sesión de WhatsApp cerrada desde el celular. Hay que volver a escanear el QR.");
+      } else {
+        console.log("Reintentando conexión de WhatsApp...");
+        void iniciarWhatsapp();
+      }
+    }
+  });
+
+  sock.ev.on("messages.upsert", ({ messages, type }) => {
+    if (type !== "notify") return;
+
+    for (const msg of messages) {
+      void (async () => {
+        const jid = msg.key.remoteJid;
+        if (!jid) return;
+
+        console.log(`[DEBUG CRUDO] De: ${jid} | Texto: "${extraerTexto(msg)}" | EsMio:"${msg.key.fromMe}"`);
+
+        //Ignorar mensajes propios, de grupos y de estados/sistema. Solo chats privados.
+        if (msg.key.fromMe || jid.endsWith("@g.us") || jid === "status@broadcast") return;
+
+        const texto = extraerTexto(msg);
+        //Si el mensaje no tiene texto, lo ignora de inmediato (elimina la basura de
+        //sincronización multimedia: imágenes, stickers, etc.).
+        if (!texto || texto.trim() === "") return;
+
+        //Limpieza del número: quita el "@s.whatsapp.net"
+        const numeroTelefono = jid.split("@")[0];
+        const textoCliente = texto.trim();
+        const responder = (t: string) => sock.sendMessage(jid, { text: t });
+
+        await manejarMensaje(numeroTelefono, textoCliente, responder);
+      })();
+    }
+  });
+}

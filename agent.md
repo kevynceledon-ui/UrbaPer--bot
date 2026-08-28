@@ -6,7 +6,7 @@ Este documento sirve como la guía de referencia técnica y operativa para agent
 
 ## 📌 Descripción del Proyecto
 UrbanPeru is una aplicación full-stack compuesta por:
-1. **Backend (Node.js / Express / TypeScript)**: Servidor API REST, autenticación JWT, conexión a PostgreSQL mediante Sequelize, WebSockets (`socket.io`) y automatización de WhatsApp (`whatsapp-web.js`).
+1. **Backend (Node.js / Express / TypeScript)**: Servidor API REST, autenticación JWT, conexión a PostgreSQL mediante Sequelize, WebSockets (`socket.io`) y automatización de WhatsApp (`Baileys`).
 2. **Frontend (React 19 / Vite / Tailwind v4 / TypeScript)**: Panel de control (Dashboard), gestión de turnos, visualización en tiempo real de pedidos/mensajes mediante WebSockets, autenticación de usuarios y diseño responsive.
 
 ---
@@ -87,7 +87,7 @@ Los siguientes componentes, características y mejoras aún no están implementa
 2. **Modelos de Datos y Endpoints de Órdenes (Backend)**:
    - ❌ **Modelos Sequelize para Negocio**: Creación de modelos y migraciones para Órdenes, Clientes, Productos e Inventario.
    - ❌ **CRUD de Pedidos**: Endpoints REST completos (`/api/orders`) para gestión, actualización de estados y filtrado.
-3. **Integración y Monitoreo de WhatsApp (`whatsapp-web.js`)**:
+3. **Integración y Monitoreo de WhatsApp (`Baileys`)**:
    - ❌ **Dashboard QR State**: Interfaz gráfica en el frontend que reciba y muestre en tiempo real el código QR de autenticación de WhatsApp emitido por el backend vía Socket.io.
    - ❌ **Gestión de Sesiones y Reconexión**: Lógica avanzada de auto-reconexión ante caídas de la API de WhatsApp y almacenamiento persistente de sesión seguro.
 4. **Control de Accesos Basado en Roles (RBAC)**:

@@ -8,7 +8,7 @@ import rateLimit from "express-rate-limit";
 import { sequelize } from "./config/db.js";
 import { initSocket } from "./config/socket.js";
 import authRoutes from "./routes/auth.js";
-import whatsappClient from "./services/whatsappServices.js";
+import { iniciarWhatsapp } from "./services/whatsappServices.js";
 
 // Variables obligatorias en producción: sin ellas el server no debe arrancar
 // con fallbacks inseguros conocidos (ver src/routes/auth.ts).
@@ -99,12 +99,9 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`Servidor corriendo en http://localhost:${PORT} y http://192.168.1.6:${PORT}`);
   console.log(`CORS permitido para: ${allowedOrigins.join(", ")}`);
 
-  // Inicializa cliente de WhatsApp
-  try {
-    whatsappClient.initialize();
-  } catch (e) {
-    console.error("Error inicializando WhatsApp:", e);
-  }
+  // Inicializa cliente de WhatsApp (async: se maneja con .catch, no con try/catch,
+  // porque el error puede llegar en una promesa rechazada más adelante, no al llamar).
+  iniciarWhatsapp().catch((e) => console.error("Error inicializando WhatsApp:", e));
 
   try {
     await sequelize.authenticate();
