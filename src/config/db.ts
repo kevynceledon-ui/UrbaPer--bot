@@ -100,6 +100,12 @@ class Pedido extends Model<InferAttributes<Pedido>, InferCreationAttributes<Pedi
   declare estado: CreationOptional<EstadoPedido>;
   declare total: CreationOptional<number>;
   declare notas: CreationOptional<string | null>;
+  //Pedidos anteriores a este cambio no lo tienen (por eso nullable).
+  declare metodoPago: CreationOptional<"efectivo" | "transferencia" | null>;
+  //Comprobante de transferencia como data URL base64. Solo para revisión visual del
+  //equipo en el dashboard — no hay verificación automática de que la plata haya
+  //llegado de verdad (ver plan de "método de pago + pedidos fantasma").
+  declare comprobanteImagen: CreationOptional<string | null>;
   declare cliente_id: ForeignKey<Cliente["id"]>;
   declare createdAt: CreationOptional<Date>;
   declare updatedAt: CreationOptional<Date>;
@@ -125,6 +131,16 @@ Pedido.init(
       defaultValue: 0,
     },
     notas: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+      defaultValue: null,
+    },
+    metodoPago: {
+      type: DataTypes.ENUM("efectivo", "transferencia"),
+      allowNull: true,
+      defaultValue: null,
+    },
+    comprobanteImagen: {
       type: DataTypes.TEXT,
       allowNull: true,
       defaultValue: null,

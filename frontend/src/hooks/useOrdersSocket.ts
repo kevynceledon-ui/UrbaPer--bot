@@ -3,7 +3,7 @@ import type { Socket } from 'socket.io-client'
 import type { Order } from '../types/order'
 import { getSocket, disconnectSocket } from '../services/socket'
 import { playNotificationSound } from '../utils/audio'
-import { getPedidosActivos, marcarPedidoEntregado } from '../services/api'
+import { getPedidosActivos, marcarPedidoEntregado, marcarPedidoNoLlego } from '../services/api'
 
 export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
   const [orders, setOrders] = useState<Order[]>([])
@@ -94,11 +94,20 @@ export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
     }
   }, [token])
 
+  // Mismo patrón optimista que removeOrder, pero marca "cancelado" en vez de
+  // "entregado" — usado por el botón "❌ No llegó" para el historial de no-shows.
+  const marcarNoLlego = useCallback((id: string | number) => {
+    setOrders((prev) => prev.filter(o => String(o.id) !== String(id)))
+    if (token) {
+      marcarPedidoNoLlego(id, token).catch((e) => console.warn('[Pedidos] No se pudo marcar como no llegó:', e))
+    }
+  }, [token])
+
   // Exponer disconnect manual para logout
   const disconnect = useCallback(() => {
     disconnectSocket()
     setConnectionState('disconnected')
   }, [])
 
-  return { orders, lastOrder, connectionState, clearOrders, removeOrder, disconnect, setOrders }
+  return { orders, lastOrder, connectionState, clearOrders, removeOrder, marcarNoLlego, disconnect, setOrders }
 }

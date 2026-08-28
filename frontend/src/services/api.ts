@@ -74,16 +74,26 @@ export async function getPedidosActivos(token: string): Promise<import('../types
   return data.pedidos
 }
 
-export async function marcarPedidoEntregado(id: string | number, token: string): Promise<void> {
+export type EstadoPedido = 'comprando' | 'pendiente' | 'preparando' | 'listo' | 'entregado' | 'cancelado'
+
+export async function actualizarEstadoPedido(id: string | number, estado: EstadoPedido, token: string): Promise<void> {
   const res = await fetch(`${API_URL}/api/pedidos/${id}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ estado: 'entregado' }),
+    body: JSON.stringify({ estado }),
   })
   const data = await res.json()
   if (!res.ok || !data.ok) {
     throw new Error(data.error ?? 'No se pudo actualizar el pedido')
   }
+}
+
+export function marcarPedidoEntregado(id: string | number, token: string): Promise<void> {
+  return actualizarEstadoPedido(id, 'entregado', token)
+}
+
+export function marcarPedidoNoLlego(id: string | number, token: string): Promise<void> {
+  return actualizarEstadoPedido(id, 'cancelado', token)
 }
 
 //Clientes que pidieron hablar con una persona y el bot todavía tiene pausado.

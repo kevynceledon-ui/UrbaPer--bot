@@ -29,7 +29,7 @@ export function DashboardPage() {
   const { isSupported: wakeSupported, isLocked: wakeLocked, error: wakeError } = useWakeLock(shiftStarted)
 
   // Socket solo si hay token
-  const { orders, lastOrder, connectionState, removeOrder, disconnect } = useOrdersSocket(token, audioUnlocked)
+  const { orders, lastOrder, connectionState, removeOrder, marcarNoLlego, disconnect } = useOrdersSocket(token, audioUnlocked)
   const { qr: whatsappQr } = useWhatsappStatus(token)
   const { clientes: clientesEsperando, devolverAlBot } = useClientesEsperando(token)
   const [highlightId, setHighlightId] = useState<string | number | null>(null)
@@ -218,7 +218,7 @@ export function DashboardPage() {
         ) : (
           <div className="space-y-3" aria-live="polite" aria-relevant="additions">
             {orders.map(o => (
-              <OrderCard key={String(o.id)} order={o} isNew={String(o.id) === String(highlightId)} onDismiss={removeOrder} />
+              <OrderCard key={String(o.id)} order={o} isNew={String(o.id) === String(highlightId)} onDismiss={removeOrder} onNoLlego={marcarNoLlego} />
             ))}
           </div>
         )}

@@ -1,6 +1,7 @@
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
+  downloadMediaMessage,
   type WAMessage,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
@@ -18,6 +19,11 @@ const carritos: Record<string, CarritoItem[]> = {};
 //Nota de alergias/instrucciones especiales pendiente de confirmar (ver estado
 //PIDIENDO_NOTA / CONFIRMANDO_PEDIDO).
 const notasPendientes: Record<string, string> = {};
+//Método de pago elegido (ver estado PIDIENDO_METODO_PAGO) y comprobante de
+//transferencia recibido (ver estado ESPERANDO_COMPROBANTE), ambos pendientes
+//hasta la confirmación final.
+const metodosPagoPendientes: Record<string, "efectivo" | "transferencia"> = {};
+const comprobantesPendientes: Record<string, string> = {};
 
 //Import de las tablas
 import { Cliente, Pedido, Producto, DetallePedido } from "../config/db.js";
@@ -45,7 +51,11 @@ function generarMenuTexto(): string {
 
 //Arma el listado de items + total (usado tanto en la vista previa antes de
 //confirmar como en el recibo final, para no duplicar el cálculo).
-function formatResumenCarrito(carrito: CarritoItem[], nota: string): { texto: string; total: number } {
+function formatResumenCarrito(
+  carrito: CarritoItem[],
+  nota: string,
+  metodoPago?: "efectivo" | "transferencia"
+): { texto: string; total: number } {
   let total = 0;
   let texto = "";
   carrito.forEach((item) => {
@@ -53,6 +63,9 @@ function formatResumenCarrito(carrito: CarritoItem[], nota: string): { texto: st
     total += item.precio;
   });
   texto += `\n*Total: $${total.toLocaleString("es-CL")}*`;
+  if (metodoPago) {
+    texto += `\n💳 Pago: ${metodoPago === "efectivo" ? "Efectivo" : "Transferencia"}`;
+  }
   if (nota) {
     texto += `\n📝 Nota: ${nota}`;
   }
@@ -80,6 +93,14 @@ async function manejarMensaje(
   //la conversación manual hasta que alguien del equipo lo devuelva al bot desde
   //el dashboard.
   if (estadosUsuarios[numeroTelefono] === "HABLANDO_CON_HUMANO") {
+    return;
+  }
+
+  //Si llegó texto en vez de una imagen mientras se esperaba el comprobante (la
+  //imagen en sí se maneja antes de esta función, en messages.upsert, porque
+  //necesita el socket para descargarla).
+  if (estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE") {
+    await responder("Por favor envía la *imagen* del comprobante de transferencia (foto o captura de pantalla).");
     return;
   }
 
@@ -116,6 +137,24 @@ async function manejarMensaje(
       console.log(`Cliente frecuente Telefono: ${numeroTelefono}`);
     }
 
+    // 3a0. ¿ESTAMOS ESPERANDO EL MÉTODO DE PAGO?
+    if (estadosUsuarios[numeroTelefono] === "PIDIENDO_METODO_PAGO") {
+      if (textoCliente === "1") {
+        metodosPagoPendientes[numeroTelefono] = "efectivo";
+        estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
+        await responder("📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
+        return;
+      }
+      if (textoCliente === "2") {
+        metodosPagoPendientes[numeroTelefono] = "transferencia";
+        estadosUsuarios[numeroTelefono] = "ESPERANDO_COMPROBANTE";
+        await responder("📸 Envía la *imagen* de tu comprobante de transferencia (foto o captura de pantalla).");
+        return;
+      }
+      await responder("Por favor responde *1* para Efectivo o *2* para Transferencia.");
+      return;
+    }
+
     // 3a. ¿ESTAMOS ESPERANDO LA NOTA DE ALERGIAS/INSTRUCCIONES ESPECIALES?
     if (estadosUsuarios[numeroTelefono] === "PIDIENDO_NOTA") {
       const nota = textoCliente.toLowerCase() === "no" ? "" : textoCliente;
@@ -123,7 +162,7 @@ async function manejarMensaje(
       estadosUsuarios[numeroTelefono] = "CONFIRMANDO_PEDIDO";
 
       const miCarrito = carritos[numeroTelefono] ?? [];
-      const { texto } = formatResumenCarrito(miCarrito, nota);
+      const { texto } = formatResumenCarrito(miCarrito, nota, metodosPagoPendientes[numeroTelefono]);
       await responder(`*🧾 REVISA TU PEDIDO ANTES DE ENVIARLO:*\n\n${texto}\n\n¿Confirmas? Responde *SI* para mandarlo a cocina o *NO* para seguir editando.`);
       return;
     }
@@ -136,6 +175,8 @@ async function manejarMensaje(
 
       if (respuesta === "no") {
         estadosUsuarios[numeroTelefono] = "REALIZANDO_PEDIDO";
+        delete metodosPagoPendientes[numeroTelefono];
+        delete comprobantesPendientes[numeroTelefono];
         await responder("Sin problema, sigue agregando platos o escribe *pagar* cuando estés listo.");
         return;
       }
@@ -153,19 +194,30 @@ async function manejarMensaje(
       }
 
       const nota = notasPendientes[numeroTelefono] ?? "";
-      const { texto: resumenItems, total } = formatResumenCarrito(miCarrito, nota);
+      const metodoPago = metodosPagoPendientes[numeroTelefono];
+      const comprobanteImagen = comprobantesPendientes[numeroTelefono] ?? null;
+      const { texto: resumenItems, total } = formatResumenCarrito(miCarrito, nota, metodoPago);
       const resumen = `*🧾 RESUMEN DE TU PEDIDO:*\n\n${resumenItems}\n\n¡Tu pedido ha sido confirmado! 🧑‍🍳 En breve te contactaremos para coordinar el pago y la entrega.`;
 
       // ============ PERSISTENCIA EN BD ============
       // Guarda el pedido y sus detalles para que sobreviva a un reinicio del bot
       // y quede disponible aunque ningún dashboard esté conectado al emitirse.
       let pedidoId: string = `pedido_${Date.now()}`;
+      //Cuántos pedidos anteriores de este cliente quedaron marcados "cancelado"
+      //(el equipo los usa para marcar "no llegó" desde el dashboard). Se avisa al
+      //equipo en el mismo pedido nuevo para que decidan si piden algo extra de
+      //garantía antes de empezar a cocinar.
+      let noShows = 0;
       try {
+        noShows = await Pedido.count({ where: { cliente_id: cliente.id, estado: "cancelado" } });
+
         const nuevoPedido = await Pedido.create({
           cliente_id: cliente.id,
           estado: "pendiente",
           total,
           notas: nota || null,
+          metodoPago: metodoPago ?? null,
+          comprobanteImagen,
         });
         pedidoId = nuevoPedido.id;
 
@@ -203,6 +255,9 @@ async function manejarMensaje(
           items: [...miCarrito],
           total,
           resumen: nota,
+          metodoPago: metodoPago ?? null,
+          comprobanteImagen,
+          clienteNoShows: noShows,
           fecha: new Date().toISOString(),
         };
 
@@ -221,6 +276,8 @@ async function manejarMensaje(
       delete estadosUsuarios[numeroTelefono];
       delete carritos[numeroTelefono];
       delete notasPendientes[numeroTelefono];
+      delete metodosPagoPendientes[numeroTelefono];
+      delete comprobantesPendientes[numeroTelefono];
 
       await responder(resumen);
       return;
@@ -265,7 +322,8 @@ async function manejarMensaje(
     // 5. LÓGICA DEL CARRITO (SOLO si el estado es REALIZANDO_PEDIDO)
     if (estadosUsuarios[numeroTelefono] === "REALIZANDO_PEDIDO") {
       // a) Si el cliente quiere pagar: pasa a pedir nota + confirmación antes de
-      // crear nada en firme (ver estados PIDIENDO_NOTA / CONFIRMANDO_PEDIDO arriba).
+      // crear nada en firme (ver estados PIDIENDO_METODO_PAGO / PIDIENDO_NOTA /
+      // CONFIRMANDO_PEDIDO arriba).
       if (textoCliente.toLowerCase() === "pagar") {
         const miCarrito = carritos[numeroTelefono];
 
@@ -274,8 +332,8 @@ async function manejarMensaje(
           return;
         }
 
-        estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
-        await responder("📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
+        estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
+        await responder("💳 ¿Cómo vas a pagar?\n\n1️⃣ Efectivo\n2️⃣ Transferencia");
         return;
       }
 
@@ -408,11 +466,6 @@ export async function iniciarWhatsapp(): Promise<void> {
         //Ignorar mensajes propios, de grupos y de estados/sistema. Solo chats privados.
         if (msg.key.fromMe || jid.endsWith("@g.us") || jid === "status@broadcast") return;
 
-        const texto = extraerTexto(msg);
-        //Si el mensaje no tiene texto, lo ignora de inmediato (elimina la basura de
-        //sincronización multimedia: imágenes, stickers, etc.).
-        if (!texto || texto.trim() === "") return;
-
         //Desde 2024 WhatsApp usa un LID (identificador opaco, ej. "197135257587855@lid")
         //en vez del número real en remoteJid para ocultarlo por privacidad. El teléfono
         //real, cuando WhatsApp lo entrega, viene en msg.key.senderPn. Si no está disponible
@@ -424,9 +477,38 @@ export async function iniciarWhatsapp(): Promise<void> {
         //(ej. "56912345678:12@s.whatsapp.net"), que si no se corta queda pegado al número.
         const fuenteTelefono = msg.key.senderPn ?? jid;
         const numeroTelefono = fuenteTelefono.split("@")[0].split(":")[0];
-        const textoCliente = texto.trim();
         const responder = (t: string) => sock.sendMessage(jid, { text: t });
 
+        //Comprobante de transferencia: es una imagen, no pasa por el filtro de solo-texto
+        //de abajo. Se maneja acá (no en manejarMensaje) porque necesita `sock` para
+        //descargar el archivo.
+        const imagen = msg.message?.imageMessage;
+        if (estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE" && imagen) {
+          try {
+            const buffer = await downloadMediaMessage(msg, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage });
+            const mime = imagen.mimetype || "image/jpeg";
+            comprobantesPendientes[numeroTelefono] = `data:${mime};base64,${buffer.toString("base64")}`;
+            estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
+            await responder("✅ Comprobante recibido.\n\n📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
+          } catch (e) {
+            console.error("Error descargando comprobante de transferencia:", e);
+            await responder("❌ No pude leer esa imagen, ¿puedes volver a enviarla?");
+          }
+          return;
+        }
+
+        const texto = extraerTexto(msg);
+        //Si el mensaje no tiene texto, lo ignora de inmediato (elimina la basura de
+        //sincronización multimedia: imágenes, stickers, etc.) — salvo que estuviera
+        //esperando el comprobante, donde vale la pena avisarle que mande la imagen.
+        if (!texto || texto.trim() === "") {
+          if (estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE") {
+            await responder("Por favor envía la *imagen* del comprobante de transferencia (foto o captura de pantalla).");
+          }
+          return;
+        }
+
+        const textoCliente = texto.trim();
         await manejarMensaje(numeroTelefono, textoCliente, responder);
       })();
     }

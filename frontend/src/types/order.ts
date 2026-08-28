@@ -10,12 +10,17 @@ export interface OrderItem {
   cantidad?: number
 }
 
+export type MetodoPago = 'efectivo' | 'transferencia'
+
 export interface Order {
   id: string | number
   cliente: Cliente
   items: OrderItem[]
   total: number
   resumen: string
+  metodoPago?: MetodoPago | null
+  comprobanteImagen?: string | null
+  clienteNoShows?: number
   fecha: string // ISO string
 }
 

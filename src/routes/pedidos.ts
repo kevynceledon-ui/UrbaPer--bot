@@ -28,6 +28,17 @@ router.get("/pedidos", authenticateToken, async (_req, res) => {
       ],
     });
 
+    // Historial de no-shows por cliente (cuántos pedidos anteriores quedaron
+    // "cancelado"), para que el equipo lo vea antes de empezar a cocinar. Se
+    // agrupa por cliente para no repetir la misma consulta varias veces.
+    const clienteIds = [...new Set(pedidos.map((p) => p.cliente_id))];
+    const noShowsPorCliente = new Map<string, number>();
+    await Promise.all(
+      clienteIds.map(async (id) => {
+        noShowsPorCliente.set(id, await Pedido.count({ where: { cliente_id: id, estado: "cancelado" } }));
+      })
+    );
+
     const data = pedidos.map((p) => ({
       id: p.id,
       cliente: {
@@ -42,6 +53,9 @@ router.get("/pedidos", authenticateToken, async (_req, res) => {
       })),
       total: p.total,
       resumen: p.notas ?? "",
+      metodoPago: p.metodoPago ?? null,
+      comprobanteImagen: p.comprobanteImagen ?? null,
+      clienteNoShows: noShowsPorCliente.get(p.cliente_id) ?? 0,
       fecha: p.createdAt.toISOString(),
     }));
 

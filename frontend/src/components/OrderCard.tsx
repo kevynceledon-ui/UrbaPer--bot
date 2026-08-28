@@ -27,7 +27,14 @@ function numeroLimpio(telefono: string): string {
   return telefono.split(':')[0].replace(/\D/g, '')
 }
 
-export function OrderCard({ order, isNew, onDismiss }: { order: Order; isNew?: boolean; onDismiss?: (id: string | number) => void }) {
+type Props = {
+  order: Order
+  isNew?: boolean
+  onDismiss?: (id: string | number) => void
+  onNoLlego?: (id: string | number) => void
+}
+
+export function OrderCard({ order, isNew, onDismiss, onNoLlego }: Props) {
   const tel = numeroLimpio(order.cliente.telefono)
   const telIntl = tel.startsWith('56') ? tel : `56${tel}`
   const waUrl = `https://wa.me/${telIntl}?text=${encodeURIComponent(`Hola ${order.cliente.nombre}, tu pedido #${order.id} está en preparación 🍗`)}`
@@ -43,6 +50,13 @@ export function OrderCard({ order, isNew, onDismiss }: { order: Order; isNew?: b
         <span className="absolute -right-2 -top-2 rounded-full bg-brand-500 px-2.5 py-1 text-[11px] font-black tracking-widest text-zinc-900 shadow-md">
           ¡NUEVO!
         </span>
+      )}
+
+      {/* Aviso de no-shows: informativo, la decisión la toma el equipo */}
+      {!!order.clienteNoShows && order.clienteNoShows > 0 && (
+        <p className="rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs font-bold text-red-300">
+          ⚠️ Este cliente tiene {order.clienteNoShows} pedido{order.clienteNoShows !== 1 ? 's' : ''} anterior{order.clienteNoShows !== 1 ? 'es' : ''} no retirado{order.clienteNoShows !== 1 ? 's' : ''}
+        </p>
       )}
 
       {/* Header tarjeta */}
@@ -62,6 +76,11 @@ export function OrderCard({ order, isNew, onDismiss }: { order: Order; isNew?: b
           <span className="rounded-2xl bg-brand-500 px-3 py-1.5 text-sm font-black text-zinc-900">
             {formatCLP(order.total)}
           </span>
+          {order.metodoPago && (
+            <span className="rounded-full bg-zinc-800 px-2.5 py-1 text-[11px] font-bold text-zinc-300">
+              {order.metodoPago === 'efectivo' ? '💵 Efectivo' : '🏦 Transferencia'}
+            </span>
+          )}
           {onDismiss && (
             <button
               onClick={() => onDismiss(order.id)}
@@ -69,6 +88,15 @@ export function OrderCard({ order, isNew, onDismiss }: { order: Order; isNew?: b
               aria-label={`Marcar pedido ${order.id} como listo`}
             >
               ✓ Listo
+            </button>
+          )}
+          {onNoLlego && (
+            <button
+              onClick={() => onNoLlego(order.id)}
+              className="text-[11px] font-semibold text-zinc-500 underline decoration-dotted hover:text-red-400 transition"
+              aria-label={`Marcar pedido ${order.id} como no retirado`}
+            >
+              ❌ No llegó
             </button>
           )}
         </div>
@@ -88,6 +116,18 @@ export function OrderCard({ order, isNew, onDismiss }: { order: Order; isNew?: b
             </li>
           ))}
         </ul>
+        {order.comprobanteImagen && (
+          <a
+            href={order.comprobanteImagen}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="mt-3 flex items-center gap-3 rounded-xl border border-zinc-800/80 bg-zinc-900 p-2"
+            aria-label="Ver comprobante de transferencia a tamaño completo"
+          >
+            <img src={order.comprobanteImagen} alt="Comprobante de transferencia" className="h-14 w-14 rounded-lg object-cover border border-zinc-800" />
+            <span className="text-xs font-bold text-zinc-300">🧾 Ver comprobante de transferencia</span>
+          </a>
+        )}
         {order.resumen && (
           <p className="mt-3 rounded-xl bg-brand-500/10 border border-brand-500/20 px-3 py-2 text-sm font-medium text-brand-200">
             📝 {order.resumen}
