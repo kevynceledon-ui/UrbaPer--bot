@@ -1,5 +1,6 @@
 import { Client, LocalAuth, Message } from "whatsapp-web.js";
 import qrcode from "qrcode-terminal";
+import QRCode from "qrcode";
 
 //Memoria temporal.
 const estadosUsuarios: Record<string, string> = {};
@@ -56,14 +57,34 @@ const client = new Client({
 });
 
 //Cuando el bot necesite vinculo arrojara el qr en consola.
+//El log en vivo de Render distorsiona el QR ASCII (fuente no monoespaciada), así que
+//además lo mandamos como imagen por el socket ya autenticado con JWT para que el
+//dashboard lo muestre y se pueda escanear desde el celular sin pasar por Render.
 client.on("qr", (qr) => {
   qrcode.generate(qr, { small: true });
-  console.log("Escanea este código QR en el wsp del negocio");
+  console.log("Escanea este código QR en el wsp del negocio (o desde el dashboard)");
+
+  QRCode.toDataURL(qr)
+    .then(async (dataUrl) => {
+      const { getIO } = await import("../config/socket.js");
+      try {
+        getIO().emit("whatsapp_qr", { qr: dataUrl });
+      } catch (e) {
+        console.warn("[Socket.IO] No se pudo emitir whatsapp_qr:", e instanceof Error ? e.message : e);
+      }
+    })
+    .catch((e) => console.error("Error generando QR como imagen:", e));
 });
 
 //Evento de éxito
-client.on("ready", () => {
+client.on("ready", async () => {
   console.log("Cliente de wsp conecta y listo para recibir pedidos.");
+  const { getIO } = await import("../config/socket.js");
+  try {
+    getIO().emit("whatsapp_ready");
+  } catch (e) {
+    console.warn("[Socket.IO] No se pudo emitir whatsapp_ready:", e instanceof Error ? e.message : e);
+  }
 });
 
 //el bot escucha todo lo que llega

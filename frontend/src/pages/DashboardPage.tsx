@@ -6,6 +6,7 @@ import { StartShiftButton } from '../components/StartShiftButton'
 import { useWakeLock } from '../hooks/useWakeLock'
 import { useAudioUnlock } from '../hooks/useAudioUnlock'
 import { useOrdersSocket } from '../hooks/useOrdersSocket'
+import { useWhatsappStatus } from '../hooks/useWhatsappStatus'
 import { playNotificationSound } from '../utils/audio'
 import { verifyToken } from '../services/api'
 import { disconnectSocket } from '../services/socket'
@@ -24,6 +25,7 @@ export function DashboardPage() {
 
   // Socket solo si hay token
   const { orders, lastOrder, connectionState, removeOrder, disconnect } = useOrdersSocket(token, audioUnlocked)
+  const { qr: whatsappQr } = useWhatsappStatus(token)
   const [highlightId, setHighlightId] = useState<string | number | null>(null)
 
   // Resalta la tarjeta del último pedido real recibido por socket ("¡NUEVO!")
@@ -124,6 +126,20 @@ export function DashboardPage() {
       />
 
       <main className="mx-auto w-full max-w-[520px] flex-1 px-4 pb-24 pt-4">
+        {/* WhatsApp desvinculado: bloquea todo hasta escanear */}
+        {whatsappQr && (
+          <div role="alert" className="mb-4 rounded-[24px] border border-brand-400/40 bg-zinc-900 p-5 text-center">
+            <p className="text-sm font-black tracking-wide text-brand-300 uppercase">WhatsApp desvinculado</p>
+            <p className="mt-1 text-sm text-zinc-400">Escanea este código con el WhatsApp del negocio (Dispositivos vinculados) para empezar a recibir pedidos.</p>
+            <img
+              src={whatsappQr}
+              alt="Código QR para vincular WhatsApp"
+              className="mx-auto mt-4 h-56 w-56 rounded-2xl border border-zinc-800 bg-white p-2"
+            />
+            <p className="mt-3 text-xs text-zinc-500">El código expira solo; si se ve viejo, espera a que llegue uno nuevo.</p>
+          </div>
+        )}
+
         {/* Avisos superiores */}
         <div className="space-y-2 mb-4">
           {!audioUnlocked && (
