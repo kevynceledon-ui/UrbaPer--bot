@@ -326,8 +326,10 @@ export async function iniciarWhatsapp(): Promise<void> {
         //sincronización multimedia: imágenes, stickers, etc.).
         if (!texto || texto.trim() === "") return;
 
-        //Limpieza del número: quita el "@s.whatsapp.net"
-        const numeroTelefono = jid.split("@")[0];
+        //Limpieza del número: quita el "@s.whatsapp.net" y el sufijo ":idDispositivo"
+        //que WhatsApp multi-dispositivo agrega (ej. "56912345678:12@s.whatsapp.net").
+        //Sin el segundo split, el ":12" quedaba pegado al número en el link de wa.me.
+        const numeroTelefono = jid.split("@")[0].split(":")[0];
         const textoCliente = texto.trim();
         const responder = (t: string) => sock.sendMessage(jid, { text: t });
 

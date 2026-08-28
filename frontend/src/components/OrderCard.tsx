@@ -20,9 +20,17 @@ function formatCLP(valor: number): string {
   return new Intl.NumberFormat('es-CL', { style: 'currency', currency: 'CLP', minimumFractionDigits: 0 }).format(valor)
 }
 
+// Se queda solo con los dígitos del número (11 en Chile: 56 9 XXXXXXXX). Corta
+// cualquier sufijo tipo ":idDispositivo" que WhatsApp multi-dispositivo agrega al
+// JID antes de limpiar, para no arrastrar esos dígitos pegados al número real.
+function numeroLimpio(telefono: string): string {
+  return telefono.split(':')[0].replace(/\D/g, '')
+}
+
 export function OrderCard({ order, isNew, onDismiss }: { order: Order; isNew?: boolean; onDismiss?: (id: string | number) => void }) {
-  const tel = order.cliente.telefono.replace(/\D/g, '')
-  const waUrl = `https://wa.me/${tel.startsWith('56') ? tel : `56${tel}`}?text=${encodeURIComponent(`Hola ${order.cliente.nombre}, tu pedido #${order.id} está en preparación 🍗`)}`
+  const tel = numeroLimpio(order.cliente.telefono)
+  const telIntl = tel.startsWith('56') ? tel : `56${tel}`
+  const waUrl = `https://wa.me/${telIntl}?text=${encodeURIComponent(`Hola ${order.cliente.nombre}, tu pedido #${order.id} está en preparación 🍗`)}`
 
   return (
     <article
@@ -45,8 +53,8 @@ export function OrderCard({ order, isNew, onDismiss }: { order: Order; isNew?: b
             <span className="text-xs font-medium text-zinc-500">{formatHora(order.fecha)} · {formatFechaLarga(order.fecha)}</span>
           </div>
           <h3 className="mt-1 truncate text-[18px] font-extrabold leading-none text-white">{order.cliente.nombre}</h3>
-          <a href={`tel:${order.cliente.telefono}`} className="text-sm font-medium text-zinc-400 underline decoration-dotted underline-offset-4">
-            {order.cliente.telefono}
+          <a href={`tel:+${telIntl}`} className="text-sm font-medium text-zinc-400 underline decoration-dotted underline-offset-4">
+            +{telIntl}
           </a>
         </div>
 
@@ -57,7 +65,7 @@ export function OrderCard({ order, isNew, onDismiss }: { order: Order; isNew?: b
           {onDismiss && (
             <button
               onClick={() => onDismiss(order.id)}
-              className="rounded-full bg-zinc-800 px-3 py-1 text-xs font-semibold text-zinc-400 hover:bg-zinc-700 hover:text-white transition"
+              className="rounded-2xl bg-emerald-500 px-4 py-2.5 text-sm font-black text-zinc-900 shadow-md shadow-emerald-500/20 hover:bg-emerald-400 active:scale-[0.98] transition"
               aria-label={`Marcar pedido ${order.id} como listo`}
             >
               ✓ Listo
@@ -99,7 +107,7 @@ export function OrderCard({ order, isNew, onDismiss }: { order: Order; isNew?: b
           <span className="text-base">💬</span> WhatsApp
         </a>
         <a
-          href={`tel:${order.cliente.telefono}`}
+          href={`tel:+${telIntl}`}
           className="flex items-center justify-center gap-2 rounded-2xl bg-zinc-800 px-4 py-3 text-sm font-bold text-white border border-zinc-700 active:scale-[0.98] transition"
         >
           📞 Llamar
