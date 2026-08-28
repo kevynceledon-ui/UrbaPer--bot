@@ -75,9 +75,26 @@ export function DashboardPage() {
     nav('/login', { replace: true })
   }, [disconnect, nav])
 
+  // El QR llega por socket sin importar en qué pantalla estés (los hooks se montan
+  // igual). Se extrae para poder mostrarlo también en las pantallas de abajo, que
+  // antes lo recibían pero nunca lo dibujaban por estar en un return anterior.
+  const qrBanner = whatsappQr && (
+    <div role="alert" className="mb-4 rounded-[24px] border border-brand-400/40 bg-zinc-900 p-5 text-center">
+      <p className="text-sm font-black tracking-wide text-brand-300 uppercase">WhatsApp desvinculado</p>
+      <p className="mt-1 text-sm text-zinc-400">Escanea este código con el WhatsApp del negocio (Dispositivos vinculados) para empezar a recibir pedidos.</p>
+      <img
+        src={whatsappQr}
+        alt="Código QR para vincular WhatsApp"
+        className="mx-auto mt-4 h-56 w-56 rounded-2xl border border-zinc-800 bg-white p-2"
+      />
+      <p className="mt-3 text-xs text-zinc-500">El código expira solo; si se ve viejo, espera a que llegue uno nuevo.</p>
+    </div>
+  )
+
   if (checking) {
     return (
-      <div className="min-h-dvh grid place-items-center bg-zinc-950">
+      <div className="min-h-dvh flex flex-col items-center justify-center gap-6 bg-zinc-950 px-5">
+        {qrBanner && <div className="w-full max-w-[360px]">{qrBanner}</div>}
         <div className="flex flex-col items-center gap-3">
           <div className="h-10 w-10 animate-spin rounded-full border-4 border-zinc-800 border-t-brand-400" aria-hidden />
           <p className="text-sm font-medium text-zinc-400">Verificando sesión…</p>
@@ -91,6 +108,8 @@ export function DashboardPage() {
     return (
       <div className="min-h-dvh flex flex-col bg-zinc-950 safe-top safe-bottom">
         <div className="flex-1 flex flex-col items-center justify-center px-5 py-8 text-center">
+          {qrBanner && <div className="w-full max-w-[360px] mb-2 text-left">{qrBanner}</div>}
+
           <div className="mb-8">
             <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-zinc-900 border border-zinc-800 text-brand-400 font-black">U</div>
             <h1 className="mt-3 text-xl font-black">URBAN PERÚ</h1>
@@ -132,18 +151,7 @@ export function DashboardPage() {
 
       <main className="mx-auto w-full max-w-[520px] flex-1 px-4 pb-24 pt-4">
         {/* WhatsApp desvinculado: bloquea todo hasta escanear */}
-        {whatsappQr && (
-          <div role="alert" className="mb-4 rounded-[24px] border border-brand-400/40 bg-zinc-900 p-5 text-center">
-            <p className="text-sm font-black tracking-wide text-brand-300 uppercase">WhatsApp desvinculado</p>
-            <p className="mt-1 text-sm text-zinc-400">Escanea este código con el WhatsApp del negocio (Dispositivos vinculados) para empezar a recibir pedidos.</p>
-            <img
-              src={whatsappQr}
-              alt="Código QR para vincular WhatsApp"
-              className="mx-auto mt-4 h-56 w-56 rounded-2xl border border-zinc-800 bg-white p-2"
-            />
-            <p className="mt-3 text-xs text-zinc-500">El código expira solo; si se ve viejo, espera a que llegue uno nuevo.</p>
-          </div>
-        )}
+        {qrBanner}
 
         {/* Clientes esperando atención humana: el bot está pausado para ellos */}
         {clientesEsperando.length > 0 && (
