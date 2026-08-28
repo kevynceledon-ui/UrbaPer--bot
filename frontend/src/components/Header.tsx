@@ -13,10 +13,12 @@ export function Header({ ordersCount, connectionState, wakeLocked, wakeSupported
     connectionState === 'connecting' ? 'bg-brand-500 animate-pulse' :
     connectionState === 'error' ? 'bg-red-500' : 'bg-zinc-500'
 
+  // Aclarado explícito: esto es la conexión del panel con el servidor (socket),
+  // NO si WhatsApp está vinculado — eran fácil de confundir con el mismo texto "Conectado".
   const label =
-    connectionState === 'connected' ? 'Conectado' :
-    connectionState === 'connecting' ? 'Conectando…' :
-    connectionState === 'error' ? 'Error' : 'Desconectado'
+    connectionState === 'connected' ? 'Panel conectado' :
+    connectionState === 'connecting' ? 'Conectando panel…' :
+    connectionState === 'error' ? 'Error de conexión' : 'Panel desconectado'
 
   return (
     <header className="sticky top-0 z-30 border-b border-zinc-800 bg-zinc-950/80 backdrop-blur-xl safe-top">
