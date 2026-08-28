@@ -52,6 +52,22 @@ const client = new Client({
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
+      // Recorte de memoria para correr Chromium en los 512MB del plan free de Render:
+      // apaga extensiones, background sync, telemetría y otras cosas que no usamos.
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-breakpad",
+      "--disable-component-update",
+      "--disable-default-apps",
+      "--disable-sync",
+      "--disable-translate",
+      "--metrics-recording-only",
+      "--mute-audio",
+      "--no-first-run",
+      "--safebrowsing-disable-auto-update",
+      "--js-flags=--max-old-space-size=128",
     ],
   },
 });

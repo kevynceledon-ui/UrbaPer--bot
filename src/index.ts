@@ -24,6 +24,12 @@ if (process.env.NODE_ENV === "production") {
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
+// Render (y Cloudflare delante) proxean las peticiones agregando X-Forwarded-For.
+// Sin esto, express-rate-limit rechaza esa cabecera como sospechosa en cada request
+// (podría ser IP spoofing de un cliente directo) y tira ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+// "1" = confía en un solo salto de proxy (el de Render), no en cualquiera.
+app.set("trust proxy", 1);
+
 // ===================== SEGURIDAD PRODUCCIÓN =====================
 
 // 1. Helmet - cabeceras seguras (XSS, clickjacking, MIME sniffing, etc.)
