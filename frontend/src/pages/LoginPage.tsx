@@ -5,13 +5,18 @@ import { login } from '../services/api'
 export function LoginPage() {
   const nav = useNavigate()
   const token = localStorage.getItem('token')
-  if (token) return <Navigate to="/" replace />
 
   const [user, setUser] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [showPass, setShowPass] = useState(false)
+
+  // Los hooks van siempre antes de cualquier return condicional: si este componente
+  // re-renderiza (ej. por el setLoading del finally tras un login exitoso) justo antes
+  // de que el router desmonte la página, el orden de hooks debe mantenerse idéntico o
+  // React tira "Rendered fewer hooks than expected".
+  if (token) return <Navigate to="/" replace />
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
