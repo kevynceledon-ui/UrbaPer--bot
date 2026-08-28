@@ -326,10 +326,17 @@ export async function iniciarWhatsapp(): Promise<void> {
         //sincronización multimedia: imágenes, stickers, etc.).
         if (!texto || texto.trim() === "") return;
 
-        //Limpieza del número: quita el "@s.whatsapp.net" y el sufijo ":idDispositivo"
-        //que WhatsApp multi-dispositivo agrega (ej. "56912345678:12@s.whatsapp.net").
-        //Sin el segundo split, el ":12" quedaba pegado al número en el link de wa.me.
-        const numeroTelefono = jid.split("@")[0].split(":")[0];
+        //Desde 2024 WhatsApp usa un LID (identificador opaco, ej. "197135257587855@lid")
+        //en vez del número real en remoteJid para ocultarlo por privacidad. El teléfono
+        //real, cuando WhatsApp lo entrega, viene en msg.key.senderPn. Si no está disponible
+        //(típico en el primer mensaje de un contacto nuevo, antes de que se sincronice el
+        //mapeo), no hay forma de recuperarlo — es una limitación de la plataforma, no
+        //nuestra: se usa el LID igual para no perder la conversación, pero no será un
+        //número real marcable.
+        //También se quita el sufijo ":idDispositivo" que WhatsApp multi-dispositivo agrega
+        //(ej. "56912345678:12@s.whatsapp.net"), que si no se corta queda pegado al número.
+        const fuenteTelefono = msg.key.senderPn ?? jid;
+        const numeroTelefono = fuenteTelefono.split("@")[0].split(":")[0];
         const textoCliente = texto.trim();
         const responder = (t: string) => sock.sendMessage(jid, { text: t });
 
