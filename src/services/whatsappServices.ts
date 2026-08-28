@@ -247,10 +247,21 @@ async function emitirEvento(evento: string, payload?: unknown): Promise<void> {
   }
 }
 
+//Evita que dos conexiones convivan a la vez usando la misma sesión (corrompe el
+//estado de Signal/cifrado si se llama iniciarWhatsapp() dos veces sin que la
+//anterior haya cerrado).
+let socketActivo = false;
+
 //Inicia (o reinicia) la conexión con WhatsApp. Baileys guarda las credenciales en
 //".baileys_auth" para no tener que re-escanear el QR en cada reinicio del proceso
 //(en el free tier de Render, sin disco persistente, igual se pierde en cada redeploy).
 export async function iniciarWhatsapp(): Promise<void> {
+  if (socketActivo) {
+    console.warn("iniciarWhatsapp() llamado mientras ya había una conexión activa; se ignora.");
+    return;
+  }
+  socketActivo = true;
+
   const { state, saveCreds } = await useMultiFileAuthState(".baileys_auth");
 
   const sock = makeWASocket({
@@ -279,6 +290,8 @@ export async function iniciarWhatsapp(): Promise<void> {
     }
 
     if (connection === "close") {
+      socketActivo = false;
+
       const statusCode = lastDisconnect?.error instanceof Boom
         ? lastDisconnect.error.output?.statusCode
         : undefined;
