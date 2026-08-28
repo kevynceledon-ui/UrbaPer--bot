@@ -99,6 +99,7 @@ class Pedido extends Model<InferAttributes<Pedido>, InferCreationAttributes<Pedi
   declare id: CreationOptional<string>;
   declare estado: CreationOptional<EstadoPedido>;
   declare total: CreationOptional<number>;
+  declare notas: CreationOptional<string | null>;
   declare cliente_id: ForeignKey<Cliente["id"]>;
   declare createdAt: CreationOptional<Date>;
   declare updatedAt: CreationOptional<Date>;
@@ -122,6 +123,11 @@ Pedido.init(
     total: {
       type: DataTypes.INTEGER,
       defaultValue: 0,
+    },
+    notas: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+      defaultValue: null,
     },
     createdAt: DataTypes.DATE,
     updatedAt: DataTypes.DATE,

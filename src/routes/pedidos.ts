@@ -41,7 +41,7 @@ router.get("/pedidos", authenticateToken, async (_req, res) => {
         cantidad: d.cantidad,
       })),
       total: p.total,
-      resumen: "",
+      resumen: p.notas ?? "",
       fecha: p.createdAt.toISOString(),
     }));
 

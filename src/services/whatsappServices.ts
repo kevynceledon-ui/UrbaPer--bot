@@ -15,6 +15,9 @@ interface CarritoItem {
   precio: number;
 }
 const carritos: Record<string, CarritoItem[]> = {};
+//Nota de alergias/instrucciones especiales pendiente de confirmar (ver estado
+//PIDIENDO_NOTA / CONFIRMANDO_PEDIDO).
+const notasPendientes: Record<string, string> = {};
 
 //Import de las tablas
 import { Cliente, Pedido, Producto, DetallePedido } from "../config/db.js";
@@ -38,6 +41,22 @@ function generarMenuTexto(): string {
     return `${numeroEmoji} ${item.nombre} - $${item.precio.toLocaleString("es-CL")}`;
   });
   return `*--- MENÚ URBANPERÚ 🇵🇪 ---*\n\n${lineas.join("\n")}\n\n👉 *Escribe el número del plato que deseas agregar a tu pedido (ej: 11).*`;
+}
+
+//Arma el listado de items + total (usado tanto en la vista previa antes de
+//confirmar como en el recibo final, para no duplicar el cálculo).
+function formatResumenCarrito(carrito: CarritoItem[], nota: string): { texto: string; total: number } {
+  let total = 0;
+  let texto = "";
+  carrito.forEach((item) => {
+    texto += `- ${item.nombre} ($${item.precio.toLocaleString("es-CL")})\n`;
+    total += item.precio;
+  });
+  texto += `\n*Total: $${total.toLocaleString("es-CL")}*`;
+  if (nota) {
+    texto += `\n📝 Nota: ${nota}`;
+  }
+  return { texto, total };
 }
 
 //Logger silencioso: Baileys es muy verboso por defecto (loguea cada paquete de protocolo).
@@ -97,6 +116,116 @@ async function manejarMensaje(
       console.log(`Cliente frecuente Telefono: ${numeroTelefono}`);
     }
 
+    // 3a. ¿ESTAMOS ESPERANDO LA NOTA DE ALERGIAS/INSTRUCCIONES ESPECIALES?
+    if (estadosUsuarios[numeroTelefono] === "PIDIENDO_NOTA") {
+      const nota = textoCliente.toLowerCase() === "no" ? "" : textoCliente;
+      notasPendientes[numeroTelefono] = nota;
+      estadosUsuarios[numeroTelefono] = "CONFIRMANDO_PEDIDO";
+
+      const miCarrito = carritos[numeroTelefono] ?? [];
+      const { texto } = formatResumenCarrito(miCarrito, nota);
+      await responder(`*🧾 REVISA TU PEDIDO ANTES DE ENVIARLO:*\n\n${texto}\n\n¿Confirmas? Responde *SI* para mandarlo a cocina o *NO* para seguir editando.`);
+      return;
+    }
+
+    // 3b. ¿ESTAMOS ESPERANDO LA CONFIRMACIÓN FINAL?
+    // Existe para evitar pedidos "fantasma": nada se guarda en la cocina hasta
+    // que el cliente confirma explícitamente con SI.
+    if (estadosUsuarios[numeroTelefono] === "CONFIRMANDO_PEDIDO") {
+      const respuesta = textoCliente.toLowerCase();
+
+      if (respuesta === "no") {
+        estadosUsuarios[numeroTelefono] = "REALIZANDO_PEDIDO";
+        await responder("Sin problema, sigue agregando platos o escribe *pagar* cuando estés listo.");
+        return;
+      }
+
+      if (respuesta !== "si" && respuesta !== "sí") {
+        await responder("Por favor responde *SI* para confirmar tu pedido o *NO* para seguir editando.");
+        return;
+      }
+
+      const miCarrito = carritos[numeroTelefono];
+      if (!miCarrito || miCarrito.length === 0) {
+        estadosUsuarios[numeroTelefono] = "REALIZANDO_PEDIDO";
+        await responder("Tu carrito quedó vacío, escribe un código válido (ej: 11) para agregar algo.");
+        return;
+      }
+
+      const nota = notasPendientes[numeroTelefono] ?? "";
+      const { texto: resumenItems, total } = formatResumenCarrito(miCarrito, nota);
+      const resumen = `*🧾 RESUMEN DE TU PEDIDO:*\n\n${resumenItems}\n\n¡Tu pedido ha sido confirmado! 🧑‍🍳 En breve te contactaremos para coordinar el pago y la entrega.`;
+
+      // ============ PERSISTENCIA EN BD ============
+      // Guarda el pedido y sus detalles para que sobreviva a un reinicio del bot
+      // y quede disponible aunque ningún dashboard esté conectado al emitirse.
+      let pedidoId: string = `pedido_${Date.now()}`;
+      try {
+        const nuevoPedido = await Pedido.create({
+          cliente_id: cliente.id,
+          estado: "pendiente",
+          total,
+          notas: nota || null,
+        });
+        pedidoId = nuevoPedido.id;
+
+        for (const item of miCarrito) {
+          const [productoDb] = await Producto.findOrCreate({
+            where: { nombre: item.nombre },
+            defaults: { nombre: item.nombre, precio: item.precio },
+          });
+          await DetallePedido.create({
+            pedido_id: nuevoPedido.id,
+            producto_id: productoDb.id,
+            cantidad: 1,
+            precio_unitario: item.precio,
+          });
+        }
+      } catch (dbErr) {
+        // No rompemos el flujo del cliente si la DB falla, pero queda registrado
+        console.error("[DB] No se pudo persistir el pedido:", dbErr);
+      }
+      // ===============================================================
+
+      // ============ EMITIR EVENTO SOCKET.IO: nuevo_pedido ============
+      // IMPORTANTE: Esta es la integración pedida. El Dashboard recibe tiempo real.
+      try {
+        const { getIO } = await import("../config/socket.js");
+        const io = getIO();
+
+        const pedidoPayload = {
+          id: pedidoId,
+          cliente: {
+            telefono: numeroTelefono,
+            nombre: cliente.nombre,
+            whatsapp: `${numeroTelefono}@s.whatsapp.net`,
+          },
+          items: [...miCarrito],
+          total,
+          resumen: nota,
+          fecha: new Date().toISOString(),
+        };
+
+        io.emit("nuevo_pedido", pedidoPayload);
+
+        console.log(`[Socket.IO] Evento 'nuevo_pedido' emitido para ${numeroTelefono} total $${total.toLocaleString("es-CL")}`);
+      } catch (socketErr) {
+        // No romper el flujo del pedido si Socket.IO aún no está listo
+        // En producción podrías persistir en DB y hacer polling fallback
+        const message = socketErr instanceof Error ? socketErr.message : String(socketErr);
+        console.warn("[Socket.IO] No se pudo emitir nuevo_pedido:", message);
+      }
+      // ===============================================================
+
+      // Limpieza de memoria
+      delete estadosUsuarios[numeroTelefono];
+      delete carritos[numeroTelefono];
+      delete notasPendientes[numeroTelefono];
+
+      await responder(resumen);
+      return;
+    }
+
     // 3. LÓGICA DEL SALUDO
     if (textoCliente.toLowerCase() === "hola") {
       if (fueCreado || !cliente.nombre || cliente.nombre.trim() === "Por definir") {
@@ -135,7 +264,8 @@ async function manejarMensaje(
 
     // 5. LÓGICA DEL CARRITO (SOLO si el estado es REALIZANDO_PEDIDO)
     if (estadosUsuarios[numeroTelefono] === "REALIZANDO_PEDIDO") {
-      // a) Si el cliente quiere pagar
+      // a) Si el cliente quiere pagar: pasa a pedir nota + confirmación antes de
+      // crear nada en firme (ver estados PIDIENDO_NOTA / CONFIRMANDO_PEDIDO arriba).
       if (textoCliente.toLowerCase() === "pagar") {
         const miCarrito = carritos[numeroTelefono];
 
@@ -144,89 +274,8 @@ async function manejarMensaje(
           return;
         }
 
-        // Cálculo total y boleta
-        let total = 0;
-        let resumen = "*🧾 RESUMEN DE TU PEDIDO:*\n\n";
-
-        // El bucle SOLO suma e imprime los platos
-        miCarrito.forEach((item) => {
-          resumen += `- ${item.nombre} ($${item.precio.toLocaleString("es-CL")})\n`;
-          total += item.precio;
-        });
-
-        // El total y la despedida van FUERA del bucle
-        resumen += `\n*Total a pagar: $${total.toLocaleString("es-CL")}*\n\n`;
-        resumen += `¡Tu pedido ha sido confirmado! 🧑‍🍳 En breve te contactaremos para coordinar el pago y la entrega.`;
-
-        // ============ PERSISTENCIA EN BD ============
-        // Guarda el pedido y sus detalles para que sobreviva a un reinicio del bot
-        // y quede disponible aunque ningún dashboard esté conectado al emitirse.
-        let pedidoId: string = `pedido_${Date.now()}`;
-        try {
-          const nuevoPedido = await Pedido.create({
-            cliente_id: cliente.id,
-            estado: "pendiente",
-            total,
-          });
-          pedidoId = nuevoPedido.id;
-
-          for (const item of miCarrito) {
-            const [productoDb] = await Producto.findOrCreate({
-              where: { nombre: item.nombre },
-              defaults: { nombre: item.nombre, precio: item.precio },
-            });
-            await DetallePedido.create({
-              pedido_id: nuevoPedido.id,
-              producto_id: productoDb.id,
-              cantidad: 1,
-              precio_unitario: item.precio,
-            });
-          }
-        } catch (dbErr) {
-          // No rompemos el flujo del cliente si la DB falla, pero queda registrado
-          console.error("[DB] No se pudo persistir el pedido:", dbErr);
-        }
-        // ===============================================================
-
-        // ============ EMITIR EVENTO SOCKET.IO: nuevo_pedido ============
-        // IMPORTANTE: Esta es la integración pedida. El Dashboard recibe tiempo real.
-        try {
-          const { getIO } = await import("../config/socket.js");
-          const io = getIO();
-
-          const pedidoPayload = {
-            id: pedidoId,
-            cliente: {
-              telefono: numeroTelefono,
-              nombre: cliente.nombre,
-              whatsapp: `${numeroTelefono}@s.whatsapp.net`,
-            },
-            items: [...miCarrito],
-            total,
-            resumen,
-            fecha: new Date().toISOString(),
-          };
-
-          // Opción A: broadcast global a todos los dashboards autenticados
-          io.emit("nuevo_pedido", pedidoPayload);
-
-          // Opción B: solo a la room dashboard (si prefieres segmentar)
-          // io.to("dashboard").emit("nuevo_pedido", pedidoPayload);
-
-          console.log(`[Socket.IO] Evento 'nuevo_pedido' emitido para ${numeroTelefono} total $${total.toLocaleString("es-CL")}`);
-        } catch (socketErr) {
-          // No romper el flujo del pedido si Socket.IO aún no está listo
-          // En producción podrías persistir en DB y hacer polling fallback
-          const message = socketErr instanceof Error ? socketErr.message : String(socketErr);
-          console.warn("[Socket.IO] No se pudo emitir nuevo_pedido:", message);
-        }
-        // ===============================================================
-
-        // Limpieza de memoria
-        delete estadosUsuarios[numeroTelefono];
-        delete carritos[numeroTelefono];
-
-        await responder(resumen);
+        estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
+        await responder("📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
         return;
       }
 
