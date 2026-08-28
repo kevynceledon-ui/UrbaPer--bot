@@ -58,11 +58,16 @@ app.use(
 );
 
 // 3. Rate Limit Global - evita DDoS / scraping masivo
+// /ping queda exento: Render lo golpea seguido como healthcheck, y si se le acaba
+// el cupo, Render cree que el servicio está caído y lo reinicia solo (matando la
+// sesión de WhatsApp en el proceso). Un healthcheck nunca debería competir por cupo
+// con tráfico real.
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutos
   max: 100, // 100 requests por IP cada 15 min
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => req.path === "/ping",
   message: { ok: false, error: "Demasiadas peticiones. Intenta más tarde." },
 });
 app.use(globalLimiter);
