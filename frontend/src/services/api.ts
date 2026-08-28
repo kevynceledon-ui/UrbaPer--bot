@@ -59,3 +59,29 @@ export async function verifyToken(token: string): Promise<boolean> {
 export function getApiUrl(): string {
   return API_URL
 }
+
+//Pedidos activos guardados en BD (no entregados/cancelados). Se usa para recuperar
+//lo que haya quedado pendiente cuando el Dashboard recarga (ej. el celular descarga
+//la pestaña en segundo plano) en vez de depender solo del evento en vivo del socket.
+export async function getPedidosActivos(token: string): Promise<import('../types/order').Order[]> {
+  const res = await fetch(`${API_URL}/api/pedidos`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  const data = await res.json()
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error ?? 'No se pudieron cargar los pedidos')
+  }
+  return data.pedidos
+}
+
+export async function marcarPedidoEntregado(id: string | number, token: string): Promise<void> {
+  const res = await fetch(`${API_URL}/api/pedidos/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ estado: 'entregado' }),
+  })
+  const data = await res.json()
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error ?? 'No se pudo actualizar el pedido')
+  }
+}

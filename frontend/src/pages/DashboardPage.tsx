@@ -18,7 +18,10 @@ export function DashboardPage() {
 
   // Audio: debe desbloquearse con gesto
   const { unlocked: audioUnlocked, loading: audioLoading, unlock } = useAudioUnlock()
-  const [shiftStarted, setShiftStarted] = useState(false)
+  // Persistido: si el celular descarga la pestaña en segundo plano y recarga, no
+  // queremos mandar de vuelta a "Iniciar Turno" (el aviso de "Sonido bloqueado" ya
+  // cubre el hecho de que el navegador igual resetea el audio en cada carga nueva).
+  const [shiftStarted, setShiftStarted] = useState(() => localStorage.getItem('shiftStarted') === '1')
 
   // WakeLock solo si el turno inició
   const { isSupported: wakeSupported, isLocked: wakeLocked, error: wakeError } = useWakeLock(shiftStarted)
@@ -53,13 +56,11 @@ export function DashboardPage() {
   }, [token, nav])
 
   const handleStartShift = useCallback(async () => {
-    const ok = await unlock()
-    if (ok) {
-      setShiftStarted(true)
-    } else {
-      // Aún sin audio, permite iniciar igual para el wake lock
-      setShiftStarted(true)
-    }
+    await unlock()
+    // Se inicia igual aunque falle el desbloqueo de audio (el banner de "Sonido
+    // bloqueado" permite reintentarlo desde el dashboard).
+    localStorage.setItem('shiftStarted', '1')
+    setShiftStarted(true)
   }, [unlock])
 
   const handleLogout = useCallback(() => {
@@ -67,6 +68,7 @@ export function DashboardPage() {
     disconnectSocket()
     localStorage.removeItem('token')
     localStorage.removeItem('user')
+    localStorage.removeItem('shiftStarted')
     nav('/login', { replace: true })
   }, [disconnect, nav])
 

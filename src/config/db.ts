@@ -7,6 +7,7 @@ import {
   InferCreationAttributes,
   CreationOptional,
   ForeignKey,
+  NonAttribute,
 } from "sequelize";
 
 //Conexión db
@@ -89,6 +90,12 @@ class Pedido extends Model<InferAttributes<Pedido>, InferCreationAttributes<Pedi
   declare estado: CreationOptional<EstadoPedido>;
   declare total: CreationOptional<number>;
   declare cliente_id: ForeignKey<Cliente["id"]>;
+  declare createdAt: CreationOptional<Date>;
+  declare updatedAt: CreationOptional<Date>;
+
+  //Poblados solo cuando se pide con `include` (ver GET /api/pedidos).
+  declare Cliente?: NonAttribute<Cliente>;
+  declare DetallePedidos?: NonAttribute<DetallePedido[]>;
 }
 
 Pedido.init(
@@ -106,6 +113,8 @@ Pedido.init(
       type: DataTypes.INTEGER,
       defaultValue: 0,
     },
+    createdAt: DataTypes.DATE,
+    updatedAt: DataTypes.DATE,
   },
   { sequelize, modelName: "Pedido" }
 );
@@ -116,6 +125,9 @@ class DetallePedido extends Model<InferAttributes<DetallePedido>, InferCreationA
   declare precio_unitario: number;
   declare pedido_id: ForeignKey<Pedido["id"]>;
   declare producto_id: ForeignKey<Producto["id"]>;
+
+  //Poblado solo cuando se pide con `include` (ver GET /api/pedidos).
+  declare Producto?: NonAttribute<Producto>;
 }
 
 DetallePedido.init(

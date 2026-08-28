@@ -8,6 +8,7 @@ import rateLimit from "express-rate-limit";
 import { sequelize } from "./config/db.js";
 import { initSocket } from "./config/socket.js";
 import authRoutes from "./routes/auth.js";
+import pedidosRoutes from "./routes/pedidos.js";
 import { iniciarWhatsapp } from "./services/whatsappServices.js";
 
 // Variables obligatorias en producción: sin ellas el server no debe arrancar
@@ -85,6 +86,7 @@ app.get("/ping", (_req, res) => {
 
 // Ruta de autenticación
 app.use("/api", authRoutes);
+app.use("/api", pedidosRoutes);
 
 // Ejemplo de ruta protegida para el Dashboard (verifica que el JWT middleware funciona en HTTP también)
 // Descomenta si quieres probar:

@@ -3,6 +3,7 @@ import type { Socket } from 'socket.io-client'
 import type { Order } from '../types/order'
 import { getSocket, disconnectSocket } from '../services/socket'
 import { playNotificationSound } from '../utils/audio'
+import { getPedidosActivos, marcarPedidoEntregado } from '../services/api'
 
 export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
   const [orders, setOrders] = useState<Order[]>([])
@@ -64,10 +65,34 @@ export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
     }
   }, [token, addOrder])
 
+  // Recupera los pedidos activos guardados en BD al montar (o si cambia el token):
+  // sin esto, recargar la página (ej. el celular descarga la pestaña en segundo
+  // plano) deja el dashboard vacío hasta que llegue un pedido nuevo por socket.
+  useEffect(() => {
+    if (!token) return
+    let cancelado = false
+    getPedidosActivos(token)
+      .then((pedidos) => {
+        if (cancelado) return
+        setOrders((prev) => {
+          const idsExistentes = new Set(prev.map((o) => String(o.id)))
+          const nuevos = pedidos.filter((p) => !idsExistentes.has(String(p.id)))
+          return [...prev, ...nuevos]
+        })
+      })
+      .catch((e) => console.warn('[Pedidos] No se pudieron cargar pedidos activos:', e))
+    return () => { cancelado = true }
+  }, [token])
+
   const clearOrders = useCallback(() => setOrders([]), [])
   const removeOrder = useCallback((id: string | number) => {
     setOrders((prev) => prev.filter(o => String(o.id) !== String(id)))
-  }, [])
+    // Persiste en BD; si falla, el pedido reaparecerá en el próximo GET /api/pedidos
+    // (mejor eso que perder de vista un pedido real por un error de red puntual).
+    if (token) {
+      marcarPedidoEntregado(id, token).catch((e) => console.warn('[Pedidos] No se pudo marcar como entregado:', e))
+    }
+  }, [token])
 
   // Exponer disconnect manual para logout
   const disconnect = useCallback(() => {
