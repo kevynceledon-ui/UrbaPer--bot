@@ -320,6 +320,16 @@ export function reanudarBot(numeroTelefono: string): void {
   delete estadosUsuarios[numeroTelefono];
 }
 
+//Último QR generado y todavía sin escanear (null si ya está vinculado). El evento
+//"whatsapp_qr" solo se emite en el instante exacto en que WhatsApp lo genera; un
+//dashboard que se conecta un poco después se lo pierde. Cacheado acá para que
+//src/config/socket.ts se lo mande apenas se conecte alguien nuevo.
+let ultimoQrDataUrl: string | null = null;
+
+export function getUltimoQr(): string | null {
+  return ultimoQrDataUrl;
+}
+
 //Evita que dos conexiones convivan a la vez usando la misma sesión (corrompe el
 //estado de Signal/cifrado si se llama iniciarWhatsapp() dos veces sin que la
 //anterior haya cerrado).
@@ -353,12 +363,16 @@ export async function iniciarWhatsapp(): Promise<void> {
     if (qr) {
       console.log("Nuevo QR generado, escanéalo desde el dashboard.");
       QRCode.toDataURL(qr)
-        .then((dataUrl) => emitirEvento("whatsapp_qr", { qr: dataUrl }))
+        .then((dataUrl) => {
+          ultimoQrDataUrl = dataUrl;
+          void emitirEvento("whatsapp_qr", { qr: dataUrl });
+        })
         .catch((e) => console.error("Error generando QR como imagen:", e));
     }
 
     if (connection === "open") {
       console.log("Cliente de wsp conecta y listo para recibir pedidos.");
+      ultimoQrDataUrl = null;
       void emitirEvento("whatsapp_ready");
     }
 

@@ -1,6 +1,7 @@
 import type { Server as HttpServer } from "http";
 import { Server, Socket } from "socket.io";
 import jwt from "jsonwebtoken";
+import { getUltimoQr } from "../services/whatsappServices.js";
 
 /**
  * Singleton de Socket.IO para poder usarlo en cualquier archivo sin circular deps.
@@ -71,6 +72,15 @@ function initSocket(httpServer: HttpServer): Server {
 
     // Opcional: unir a room dashboard para broadcast segmentado
     socket.join("dashboard");
+
+    // Si WhatsApp está esperando que lo escaneen, el evento "whatsapp_qr" ya pudo
+    // haberse emitido antes de que este dashboard terminara de conectarse. Se lo
+    // mandamos directo para que no se quede esperando el próximo QR (rota cada
+    // ~20-60s hasta que alguien lo escanea).
+    const qrPendiente = getUltimoQr();
+    if (qrPendiente) {
+      socket.emit("whatsapp_qr", { qr: qrPendiente });
+    }
 
     socket.on("disconnect", (reason) => {
       console.log(`[Socket.IO] Desconectado ${socket.id}: ${reason}`);
