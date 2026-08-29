@@ -7,6 +7,7 @@ import makeWASocket, {
 import { Boom } from "@hapi/boom";
 import pino from "pino";
 import QRCode from "qrcode";
+import { rm } from "node:fs/promises";
 
 //Memoria temporal.
 const estadosUsuarios: Record<string, string> = {};
@@ -445,10 +446,24 @@ export async function iniciarWhatsapp(): Promise<void> {
       console.error("Conexión de WhatsApp cerrada.", lastDisconnect?.error?.message ?? "");
 
       if (cerroSesion) {
-        console.error("Sesión de WhatsApp cerrada desde el celular. Hay que volver a escanear el QR.");
+        // Alguien desvinculó el dispositivo desde el celular (Dispositivos vinculados).
+        // Las credenciales guardadas ya no sirven: sin borrarlas, useMultiFileAuthState
+        // las volvería a cargar tal cual y jamás se generaría un QR nuevo, dejando el
+        // bot muerto hasta el próximo reinicio del proceso.
+        console.error("Sesión de WhatsApp cerrada desde el celular. Generando un QR nuevo...");
+        rm(".baileys_auth", { recursive: true, force: true })
+          .catch((e) => console.error("No se pudo limpiar la sesión anterior:", e))
+          .finally(() => {
+            void iniciarWhatsapp().catch((e) => console.error("Error re-vinculando WhatsApp:", e));
+          });
       } else {
         console.log("Reintentando conexión de WhatsApp...");
-        void iniciarWhatsapp();
+        // Sin este .catch(), un error acá (ej. una condición de carrera leyendo el
+        // archivo de sesión durante reconexiones seguidas) queda como una promesa
+        // rechazada sin manejar y Node mata TODO el proceso, no solo la conexión de
+        // WhatsApp — probablemente la causa real de los "Instance failed" vistos en
+        // Render durante las pruebas con varios celulares.
+        void iniciarWhatsapp().catch((e) => console.error("Error reintentando conexión de WhatsApp:", e));
       }
     }
   });
