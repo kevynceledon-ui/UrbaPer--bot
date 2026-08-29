@@ -118,3 +118,17 @@ export async function reanudarBot(telefono: string, token: string): Promise<void
     throw new Error(data.error ?? 'No se pudo devolver el bot')
   }
 }
+
+//Fuerza cerrar la sesión actual de WhatsApp y generar un QR nuevo (botón
+//"Reiniciar vínculo" para cuando el bot queda en un estado raro sin esperar
+//a un redeploy).
+export async function reiniciarWhatsapp(token: string): Promise<void> {
+  const res = await fetch(`${API_URL}/api/whatsapp/reiniciar`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  const data = await res.json()
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error ?? 'No se pudo reiniciar el vínculo')
+  }
+}

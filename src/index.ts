@@ -10,6 +10,7 @@ import { initSocket } from "./config/socket.js";
 import authRoutes from "./routes/auth.js";
 import pedidosRoutes from "./routes/pedidos.js";
 import clientesRoutes from "./routes/clientes.js";
+import whatsappRoutes from "./routes/whatsapp.js";
 import { iniciarWhatsapp } from "./services/whatsappServices.js";
 
 // Variables obligatorias en producción: sin ellas el server no debe arrancar
@@ -89,6 +90,7 @@ app.get("/ping", (_req, res) => {
 app.use("/api", authRoutes);
 app.use("/api", pedidosRoutes);
 app.use("/api", clientesRoutes);
+app.use("/api", whatsappRoutes);
 
 // Ejemplo de ruta protegida para el Dashboard (verifica que el JWT middleware funciona en HTTP también)
 // Descomenta si quieres probar:

@@ -394,6 +394,38 @@ export function getUltimoQr(): string | null {
 //anterior haya cerrado).
 let socketActivo = false;
 
+//Referencia al socket activo, para poder forzar un reinicio manual desde el
+//dashboard (ver reiniciarWhatsapp) sin esperar a que WhatsApp decida cerrar la
+//conexión por su cuenta.
+let socketRef: ReturnType<typeof makeWASocket> | null = null;
+
+//Fuerza cerrar la sesión actual y generar un QR nuevo. Usado por el botón
+//"Reiniciar vínculo" del dashboard cuando el bot queda en un estado raro (ej.
+//aparece "listo" pero no responde, o quedó un vínculo a medias de una prueba
+//anterior) y no se quiere esperar a un redeploy para limpiarlo.
+export async function reiniciarWhatsapp(): Promise<void> {
+  const anterior = socketRef;
+  if (!anterior) {
+    await rm(".baileys_auth", { recursive: true, force: true }).catch(() => {});
+    socketActivo = false;
+    await iniciarWhatsapp();
+    return;
+  }
+
+  try {
+    // logout() avisa a WhatsApp que desvincule el dispositivo; el propio evento
+    // "close" con loggedOut que dispara ya se encarga de limpiar y reconectar
+    // (ver el handler de connection.update más abajo).
+    await anterior.logout();
+  } catch (e) {
+    console.warn("No se pudo cerrar sesión formalmente, se fuerza el reinicio igual:", e);
+    await rm(".baileys_auth", { recursive: true, force: true }).catch(() => {});
+    socketActivo = false;
+    socketRef = null;
+    await iniciarWhatsapp();
+  }
+}
+
 //Inicia (o reinicia) la conexión con WhatsApp. Baileys guarda las credenciales en
 //".baileys_auth" para no tener que re-escanear el QR en cada reinicio del proceso
 //(en el free tier de Render, sin disco persistente, igual se pierde en cada redeploy).
@@ -410,6 +442,7 @@ export async function iniciarWhatsapp(): Promise<void> {
     auth: state,
     logger,
   });
+  socketRef = sock;
 
   sock.ev.on("creds.update", saveCreds);
 
@@ -437,6 +470,7 @@ export async function iniciarWhatsapp(): Promise<void> {
 
     if (connection === "close") {
       socketActivo = false;
+      if (socketRef === sock) socketRef = null;
 
       const statusCode = lastDisconnect?.error instanceof Boom
         ? lastDisconnect.error.output?.statusCode

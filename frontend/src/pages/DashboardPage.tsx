@@ -10,7 +10,7 @@ import { useOrdersSocket } from '../hooks/useOrdersSocket'
 import { useWhatsappStatus } from '../hooks/useWhatsappStatus'
 import { useClientesEsperando } from '../hooks/useClientesEsperando'
 import { playNotificationSound } from '../utils/audio'
-import { verifyToken } from '../services/api'
+import { verifyToken, reiniciarWhatsapp } from '../services/api'
 import { disconnectSocket } from '../services/socket'
 
 export function DashboardPage() {
@@ -75,6 +75,33 @@ export function DashboardPage() {
     nav('/login', { replace: true })
   }, [disconnect, nav])
 
+  // Botón de emergencia: fuerza cerrar la sesión de WhatsApp y pedir un QR nuevo,
+  // para cuando el bot queda "listo" pero en realidad no responde, o quedó a medio
+  // vincular de una prueba anterior — sin depender de un redeploy para limpiarlo.
+  const [reiniciando, setReiniciando] = useState(false)
+  const handleReiniciarWhatsapp = useCallback(async () => {
+    if (!token) return
+    if (!window.confirm('Esto va a cerrar la sesión actual de WhatsApp y vas a tener que escanear un QR nuevo. ¿Continuar?')) return
+    setReiniciando(true)
+    try {
+      await reiniciarWhatsapp(token)
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : 'No se pudo reiniciar el vínculo')
+    } finally {
+      setReiniciando(false)
+    }
+  }, [token])
+
+  const botonReiniciar = (
+    <button
+      onClick={handleReiniciarWhatsapp}
+      disabled={reiniciando}
+      className="text-xs font-semibold text-zinc-500 underline decoration-dotted hover:text-red-400 disabled:opacity-50 transition"
+    >
+      {reiniciando ? 'Reiniciando…' : '⚠️ ¿WhatsApp no responde? Reiniciar vínculo'}
+    </button>
+  )
+
   // El QR llega por socket sin importar en qué pantalla estés (los hooks se montan
   // igual). Se extrae para poder mostrarlo también en las pantallas de abajo, que
   // antes lo recibían pero nunca lo dibujaban por estar en un return anterior.
@@ -88,6 +115,7 @@ export function DashboardPage() {
         className="mx-auto mt-4 h-56 w-56 rounded-2xl border border-zinc-800 bg-white p-2"
       />
       <p className="mt-3 text-xs text-zinc-500">El código expira solo; si se ve viejo, espera a que llegue uno nuevo.</p>
+      <div className="mt-3">{botonReiniciar}</div>
     </div>
   )
 
@@ -191,6 +219,13 @@ export function DashboardPage() {
             </div>
           )}
         </div>
+
+        {/* Si ya hay un QR mostrándose, el botón de reinicio ya viene incluido ahí
+            arriba — no lo dupliques. Este es para cuando el bot "parece" listo pero
+            en realidad no está respondiendo. */}
+        {!qrBanner && (
+          <div className="mb-4 text-center">{botonReiniciar}</div>
+        )}
 
         {/* Barra acciones */}
         <div className="flex items-center justify-between gap-2 mb-3">
