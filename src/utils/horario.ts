@@ -71,19 +71,20 @@ async function calcularFranjasDisponibles(
     }
   }
 
-  const disponibles: { inicio: string; fin: string }[] = [];
-  for (const franja of candidatas) {
-    const inicioFecha = horaChileAFecha(franja.inicio);
-    const finFecha = horaChileAFecha(franja.fin);
-    const ocupados = await Pedido.count({
-      where: {
-        horaProgramada: { [Op.gte]: inicioFecha, [Op.lt]: finFecha },
-        estado: { [Op.ne]: "cancelado" },
-      },
-    });
-    if (ocupados < capacidadPorFranja) disponibles.push(franja);
-  }
-  return disponibles;
+  // Un turno partido de 15 min puede generar ~30 franjas candidatas por día — se
+  // cuentan todas en paralelo en vez de una por una (esto se llama al menos dos
+  // veces por pedido agendado: al preguntar y de nuevo al elegir modalidad).
+  const conteos = await Promise.all(
+    candidatas.map((franja) =>
+      Pedido.count({
+        where: {
+          horaProgramada: { [Op.gte]: horaChileAFecha(franja.inicio), [Op.lt]: horaChileAFecha(franja.fin) },
+          estado: { [Op.ne]: "cancelado" },
+        },
+      })
+    )
+  );
+  return candidatas.filter((_, i) => conteos[i] < capacidadPorFranja);
 }
 
 //Formatea un instante real como "HH:MM" en hora de Chile (para mostrarle al

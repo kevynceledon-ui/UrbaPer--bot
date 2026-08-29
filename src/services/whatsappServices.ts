@@ -466,12 +466,16 @@ async function manejarMensaje(
 
       if (respuesta === "no") {
         estadosUsuarios[numeroTelefono] = "REALIZANDO_PEDIDO";
-        delete metodosPagoPendientes[numeroTelefono];
-        delete comprobantesPendientes[numeroTelefono];
-        delete modalidadesPendientes[numeroTelefono];
-        delete direccionesPendientes[numeroTelefono];
-        delete montosRecibidosPendientes[numeroTelefono];
-        delete pedidosProgramadosPendientes[numeroTelefono];
+        // OJO: metodoPago/comprobante/modalidad/dirección/monto NO se borran acá.
+        // "NO" significa "déjame seguir agregando platos" (es literal lo que dice
+        // el mensaje de abajo) — esa información ya la dio el cliente y sigue
+        // siendo válida. Borrarla obligaba a mandar el comprobante de transferencia
+        // una segunda vez al volver a escribir "pagar" (bug reportado por el cliente
+        // real: ver el chequeo de "ya resuelto" en el handler de "pagar" más abajo).
+        // OJO: pedidosProgramadosPendientes NO se borra acá — si seguía cerrado
+        // cuando confirmó "no", al volver a escribir "pagar" debe recalcular
+        // franjas y volver a pedir la hora, no colarse como pedido en tiempo
+        // real (ver ADR-002). Solo se limpia lo que hay que recalcular de cero.
         delete franjasPendientes[numeroTelefono];
         delete horaProgramadaPendientes[numeroTelefono];
         await responder("Sin problema, sigue agregando platos o escribe *pagar* cuando estés listo.");
@@ -674,6 +678,29 @@ async function manejarMensaje(
 
         if (!miCarrito || miCarrito.length === 0) {
           await responder("Tu carrito está vacío. Por favor escribe un código válido (ej: 11).");
+          return;
+        }
+
+        // ¿Ya resolvió modalidad + pago en un intento anterior (dijo "no" solo
+        // para agregar más platos)? Si sigue siendo válido, no tiene sentido
+        // volver a pedir la modalidad, el método de pago ni el comprobante —
+        // se salta directo a la nota con el carrito actualizado.
+        const modalidad = modalidadesPendientes[numeroTelefono];
+        const metodoPago = metodosPagoPendientes[numeroTelefono];
+        const direccionResuelta = !modalidad || modalidad === "retiro" || !!direccionesPendientes[numeroTelefono];
+        const { total: totalActual } = formatResumenCarrito(miCarrito, "");
+        const pagoResuelto =
+          metodoPago === "transferencia" ? !!comprobantesPendientes[numeroTelefono] :
+          metodoPago === "efectivo" ? (montosRecibidosPendientes[numeroTelefono] ?? 0) >= totalActual :
+          false;
+        // Si es un pedido agendado, la hora elegida también se borró al decir "no"
+        // (ver ADR-002 — puede haber pasado tiempo y las franjas ya no ser las
+        // mismas), así que si falta hay que volver a pedirla, no saltarla.
+        const horaResuelta = !pedidosProgramadosPendientes[numeroTelefono] || !!horaProgramadaPendientes[numeroTelefono];
+
+        if (modalidad && metodoPago && pagoResuelto && direccionResuelta && horaResuelta) {
+          estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
+          await responder("📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
           return;
         }
 
