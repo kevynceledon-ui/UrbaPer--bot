@@ -132,3 +132,36 @@ export async function reiniciarWhatsapp(token: string): Promise<void> {
     throw new Error(data.error ?? 'No se pudo reiniciar el vínculo')
   }
 }
+
+export interface ConfiguracionBot {
+  activo: boolean
+  mensajePausa: string
+}
+
+//Botón de pausa/emergencia: corta las respuestas automáticas del bot.
+export async function getConfiguracion(token: string): Promise<ConfiguracionBot> {
+  const res = await fetch(`${API_URL}/api/configuracion`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  const data = await res.json()
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error ?? 'No se pudo cargar la configuración')
+  }
+  return { activo: data.activo, mensajePausa: data.mensajePausa }
+}
+
+export async function actualizarConfiguracion(
+  token: string,
+  cambios: Partial<ConfiguracionBot>
+): Promise<ConfiguracionBot> {
+  const res = await fetch(`${API_URL}/api/configuracion`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify(cambios),
+  })
+  const data = await res.json()
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error ?? 'No se pudo actualizar la configuración')
+  }
+  return { activo: data.activo, mensajePausa: data.mensajePausa }
+}

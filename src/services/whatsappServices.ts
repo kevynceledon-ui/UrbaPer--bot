@@ -8,6 +8,9 @@ import { Boom } from "@hapi/boom";
 import pino from "pino";
 import QRCode from "qrcode";
 import { rm } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { Op } from "sequelize";
 
 //Memoria temporal.
 const estadosUsuarios: Record<string, string> = {};
@@ -25,9 +28,55 @@ const notasPendientes: Record<string, string> = {};
 //hasta la confirmación final.
 const metodosPagoPendientes: Record<string, "efectivo" | "transferencia"> = {};
 const comprobantesPendientes: Record<string, string> = {};
+//Modalidad de entrega (ver estado PIDIENDO_MODALIDAD), dirección de despacho (solo
+//si delivery, ver PIDIENDO_DIRECCION) y monto con el que paga en efectivo (para
+//calcular el vuelto, ver PIDIENDO_MONTO_EFECTIVO), todos pendientes hasta la
+//confirmación final.
+const modalidadesPendientes: Record<string, "delivery" | "retiro"> = {};
+const direccionesPendientes: Record<string, string> = {};
+const montosRecibidosPendientes: Record<string, number> = {};
 
 //Import de las tablas
-import { Cliente, Pedido, Producto, DetallePedido } from "../config/db.js";
+import { Cliente, Pedido, Producto, DetallePedido, ConfiguracionBot, CONFIGURACION_BOT_ID } from "../config/db.js";
+
+//Dirección del local, mostrada automáticamente a quien elige "retiro". Si no está
+//configurada, se avisa igual sin romper el flujo.
+const DIRECCION_LOCAL = process.env.DIRECCION_LOCAL || "contáctanos para coordinar el retiro (dirección aún no configurada)";
+
+//Imagen con los datos bancarios (cuenta RUT + logo Mercado Pago) que se manda al
+//elegir "transferencia", para que el cliente no tenga que leer un mensaje de texto.
+//Se lee una sola vez al iniciar; si el archivo no está, se sigue sin mandarla.
+const RUTA_DATOS_BANCARIOS = path.join(process.cwd(), "assets", "datos-transferencia.jpg");
+let datosBancariosBuffer: Buffer | null = null;
+if (existsSync(RUTA_DATOS_BANCARIOS)) {
+  datosBancariosBuffer = readFileSync(RUTA_DATOS_BANCARIOS);
+} else {
+  console.warn(`No se encontró la imagen de datos bancarios en ${RUTA_DATOS_BANCARIOS}; se seguirá sin enviarla.`);
+}
+
+//Pausa de emergencia del bot, controlada desde el dashboard (ver src/routes/configuracion.ts).
+//Cacheada en memoria para no consultar la DB en cada mensaje entrante; se refresca
+//con actualizarConfiguracionBotCache() cuando el equipo cambia el toggle.
+let configuracionBot: { activo: boolean; mensajePausa: string } = {
+  activo: true,
+  mensajePausa: "En este momento no estamos tomando pedidos por este medio. Por favor intenta más tarde o comunícate directamente con el local.",
+};
+
+export async function cargarConfiguracionBot(): Promise<void> {
+  try {
+    const [fila] = await ConfiguracionBot.findOrCreate({
+      where: { id: CONFIGURACION_BOT_ID },
+      defaults: { id: CONFIGURACION_BOT_ID },
+    });
+    configuracionBot = { activo: fila.activo, mensajePausa: fila.mensajePausa };
+  } catch (e) {
+    console.warn("No se pudo cargar la configuración del bot, se usa el valor por defecto (activo):", e);
+  }
+}
+
+export function actualizarConfiguracionBotCache(cambios: { activo?: boolean; mensajePausa?: string }): void {
+  configuracionBot = { ...configuracionBot, ...cambios };
+}
 
 //Catálogo único: fuente de verdad para el menú mostrado y para la validación de pedidos.
 const catalogo: Record<string, CarritoItem> = {
@@ -55,7 +104,12 @@ function generarMenuTexto(): string {
 function formatResumenCarrito(
   carrito: CarritoItem[],
   nota: string,
-  metodoPago?: "efectivo" | "transferencia"
+  opts: {
+    metodoPago?: "efectivo" | "transferencia";
+    modalidad?: "delivery" | "retiro";
+    direccion?: string;
+    montoRecibido?: number;
+  } = {}
 ): { texto: string; total: number } {
   let total = 0;
   let texto = "";
@@ -64,13 +118,35 @@ function formatResumenCarrito(
     total += item.precio;
   });
   texto += `\n*Total: $${total.toLocaleString("es-CL")}*`;
-  if (metodoPago) {
-    texto += `\n💳 Pago: ${metodoPago === "efectivo" ? "Efectivo" : "Transferencia"}`;
+  if (opts.modalidad) {
+    texto += `\n${opts.modalidad === "delivery" ? "🛵 Delivery" : "🏪 Retiro en el local"}`;
+  }
+  if (opts.direccion) {
+    texto += `\n📍 Dirección: ${opts.direccion}`;
+  }
+  if (opts.metodoPago) {
+    texto += `\n💳 Pago: ${opts.metodoPago === "efectivo" ? "Efectivo" : "Transferencia"}`;
+  }
+  if (opts.montoRecibido != null) {
+    const vuelto = opts.montoRecibido - total;
+    texto += `\n💵 Pagas con: $${opts.montoRecibido.toLocaleString("es-CL")} (vuelto: $${vuelto.toLocaleString("es-CL")})`;
   }
   if (nota) {
     texto += `\n📝 Nota: ${nota}`;
   }
   return { texto, total };
+}
+
+//Cuenta pedidos activos (pendiente/preparando) creados en la última hora, para
+//estimar la demora de cocina. Un pedido olvidado por el staff más allá de 60 min
+//deja de inflar la demora de los demás (sin tocar su estado real).
+async function calcularTiempoEstimado(): Promise<{ min: number; max: number }> {
+  const haceUnaHora = new Date(Date.now() - 60 * 60 * 1000);
+  const nAnteriores = await Pedido.count({
+    where: { estado: { [Op.in]: ["pendiente", "preparando"] }, createdAt: { [Op.gte]: haceUnaHora } },
+  });
+  const n = nAnteriores + 1; // incluye el pedido que se está creando ahora
+  return { min: Math.min(15 * n, 60), max: Math.min(20 * n, 60) };
 }
 
 //Logger silencioso: Baileys es muy verboso por defecto (loguea cada paquete de protocolo).
@@ -81,7 +157,8 @@ const logger = pino({ level: "error" });
 async function manejarMensaje(
   numeroTelefono: string,
   textoCliente: string,
-  responder: (texto: string) => Promise<unknown>
+  responder: (texto: string) => Promise<unknown>,
+  enviarDatosBancarios: () => Promise<void>
 ): Promise<void> {
   if (textoCliente.toLowerCase() === "reset") {
     await Cliente.destroy({ where: { telefono: numeroTelefono } });
@@ -138,21 +215,75 @@ async function manejarMensaje(
       console.log(`Cliente frecuente Telefono: ${numeroTelefono}`);
     }
 
+    // 2b. ¿ESTAMOS ESPERANDO LA MODALIDAD DE ENTREGA?
+    // Va justo después de "pagar" y antes del método de pago (ver ADR en el handoff).
+    if (estadosUsuarios[numeroTelefono] === "PIDIENDO_MODALIDAD") {
+      if (textoCliente === "1") {
+        modalidadesPendientes[numeroTelefono] = "delivery";
+        estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
+        await responder(
+          "💳 ¿Cómo vas a pagar?\n\n1️⃣ Efectivo\n2️⃣ Transferencia\n\n📦 Recuerda: el envío se paga solo por transferencia bancaria (la comida la puedes pagar en efectivo)."
+        );
+        return;
+      }
+      if (textoCliente === "2") {
+        modalidadesPendientes[numeroTelefono] = "retiro";
+        estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
+        await responder(`📍 Retiras en nuestro local: ${DIRECCION_LOCAL}\n\n💳 ¿Cómo vas a pagar?\n\n1️⃣ Efectivo\n2️⃣ Transferencia`);
+        return;
+      }
+      await responder("Por favor responde *1* para Delivery o *2* para Retiro en el local.");
+      return;
+    }
+
     // 3a0. ¿ESTAMOS ESPERANDO EL MÉTODO DE PAGO?
     if (estadosUsuarios[numeroTelefono] === "PIDIENDO_METODO_PAGO") {
       if (textoCliente === "1") {
         metodosPagoPendientes[numeroTelefono] = "efectivo";
-        estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
-        await responder("📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
+        estadosUsuarios[numeroTelefono] = "PIDIENDO_MONTO_EFECTIVO";
+        await responder("💵 ¿Con qué billete vas a pagar, para llevarte el vuelto justo? (escribe solo el monto, ej: 10000)");
         return;
       }
       if (textoCliente === "2") {
         metodosPagoPendientes[numeroTelefono] = "transferencia";
         estadosUsuarios[numeroTelefono] = "ESPERANDO_COMPROBANTE";
+        await enviarDatosBancarios();
         await responder("📸 Envía la *imagen* de tu comprobante de transferencia (foto o captura de pantalla).");
         return;
       }
       await responder("Por favor responde *1* para Efectivo o *2* para Transferencia.");
+      return;
+    }
+
+    // 3a-bis. ¿ESTAMOS ESPERANDO EL MONTO CON QUE PAGA EN EFECTIVO?
+    if (estadosUsuarios[numeroTelefono] === "PIDIENDO_MONTO_EFECTIVO") {
+      const monto = Number(textoCliente.replace(/[^\d]/g, ""));
+      if (!monto) {
+        await responder("Por favor escribe solo el monto en números, ej: 10000.");
+        return;
+      }
+      const { total } = formatResumenCarrito(carritos[numeroTelefono] ?? [], "");
+      if (monto < total) {
+        await responder(`Ese monto no alcanza a cubrir el total ($${total.toLocaleString("es-CL")}). Escribe un monto igual o mayor.`);
+        return;
+      }
+      montosRecibidosPendientes[numeroTelefono] = monto;
+
+      if (modalidadesPendientes[numeroTelefono] === "delivery") {
+        estadosUsuarios[numeroTelefono] = "PIDIENDO_DIRECCION";
+        await responder("📍 Pásame tu dirección de entrega (calle, número, comuna).");
+      } else {
+        estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
+        await responder("📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
+      }
+      return;
+    }
+
+    // 3a-ter. ¿ESTAMOS ESPERANDO LA DIRECCIÓN DE DESPACHO? (solo delivery)
+    if (estadosUsuarios[numeroTelefono] === "PIDIENDO_DIRECCION") {
+      direccionesPendientes[numeroTelefono] = textoCliente;
+      estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
+      await responder("📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
       return;
     }
 
@@ -163,7 +294,12 @@ async function manejarMensaje(
       estadosUsuarios[numeroTelefono] = "CONFIRMANDO_PEDIDO";
 
       const miCarrito = carritos[numeroTelefono] ?? [];
-      const { texto } = formatResumenCarrito(miCarrito, nota, metodosPagoPendientes[numeroTelefono]);
+      const { texto } = formatResumenCarrito(miCarrito, nota, {
+        metodoPago: metodosPagoPendientes[numeroTelefono],
+        modalidad: modalidadesPendientes[numeroTelefono],
+        direccion: direccionesPendientes[numeroTelefono],
+        montoRecibido: montosRecibidosPendientes[numeroTelefono],
+      });
       await responder(`*🧾 REVISA TU PEDIDO ANTES DE ENVIARLO:*\n\n${texto}\n\n¿Confirmas? Responde *SI* para mandarlo a cocina o *NO* para seguir editando.`);
       return;
     }
@@ -178,6 +314,9 @@ async function manejarMensaje(
         estadosUsuarios[numeroTelefono] = "REALIZANDO_PEDIDO";
         delete metodosPagoPendientes[numeroTelefono];
         delete comprobantesPendientes[numeroTelefono];
+        delete modalidadesPendientes[numeroTelefono];
+        delete direccionesPendientes[numeroTelefono];
+        delete montosRecibidosPendientes[numeroTelefono];
         await responder("Sin problema, sigue agregando platos o escribe *pagar* cuando estés listo.");
         return;
       }
@@ -197,8 +336,17 @@ async function manejarMensaje(
       const nota = notasPendientes[numeroTelefono] ?? "";
       const metodoPago = metodosPagoPendientes[numeroTelefono];
       const comprobanteImagen = comprobantesPendientes[numeroTelefono] ?? null;
-      const { texto: resumenItems, total } = formatResumenCarrito(miCarrito, nota, metodoPago);
-      const resumen = `*🧾 RESUMEN DE TU PEDIDO:*\n\n${resumenItems}\n\n¡Tu pedido ha sido confirmado! 🧑‍🍳 En breve te contactaremos para coordinar el pago y la entrega.`;
+      const modalidad = modalidadesPendientes[numeroTelefono] ?? null;
+      const direccion = direccionesPendientes[numeroTelefono] ?? null;
+      const montoRecibido = montosRecibidosPendientes[numeroTelefono] ?? null;
+      const { texto: resumenItems, total } = formatResumenCarrito(miCarrito, nota, {
+        metodoPago,
+        modalidad: modalidad ?? undefined,
+        direccion: direccion ?? undefined,
+        montoRecibido: montoRecibido ?? undefined,
+      });
+      const tiempoEstimado = await calcularTiempoEstimado();
+      const resumen = `*🧾 RESUMEN DE TU PEDIDO:*\n\n${resumenItems}\n⏱️ Tiempo estimado: ${tiempoEstimado.min}-${tiempoEstimado.max} min\n\n¡Tu pedido ha sido confirmado! 🧑‍🍳 En breve te contactaremos para coordinar el pago y la entrega.`;
 
       // ============ PERSISTENCIA EN BD ============
       // Guarda el pedido y sus detalles para que sobreviva a un reinicio del bot
@@ -219,6 +367,11 @@ async function manejarMensaje(
           notas: nota || null,
           metodoPago: metodoPago ?? null,
           comprobanteImagen,
+          modalidad,
+          direccion,
+          montoRecibido,
+          tiempoEstimadoMin: tiempoEstimado.min,
+          tiempoEstimadoMax: tiempoEstimado.max,
         });
         pedidoId = nuevoPedido.id;
 
@@ -259,6 +412,11 @@ async function manejarMensaje(
           metodoPago: metodoPago ?? null,
           comprobanteImagen,
           clienteNoShows: noShows,
+          modalidad,
+          direccion,
+          montoRecibido,
+          tiempoEstimadoMin: tiempoEstimado.min,
+          tiempoEstimadoMax: tiempoEstimado.max,
           fecha: new Date().toISOString(),
         };
 
@@ -279,6 +437,9 @@ async function manejarMensaje(
       delete notasPendientes[numeroTelefono];
       delete metodosPagoPendientes[numeroTelefono];
       delete comprobantesPendientes[numeroTelefono];
+      delete modalidadesPendientes[numeroTelefono];
+      delete direccionesPendientes[numeroTelefono];
+      delete montosRecibidosPendientes[numeroTelefono];
 
       await responder(resumen);
       return;
@@ -333,8 +494,8 @@ async function manejarMensaje(
           return;
         }
 
-        estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
-        await responder("💳 ¿Cómo vas a pagar?\n\n1️⃣ Efectivo\n2️⃣ Transferencia");
+        estadosUsuarios[numeroTelefono] = "PIDIENDO_MODALIDAD";
+        await responder("🛵 ¿Tu pedido es para *delivery* o *retiro* en el local?\n\n1️⃣ Delivery\n2️⃣ Retiro en el local");
         return;
       }
 
@@ -436,6 +597,8 @@ export async function iniciarWhatsapp(): Promise<void> {
   }
   socketActivo = true;
 
+  await cargarConfiguracionBot();
+
   const { state, saveCreds } = await useMultiFileAuthState(".baileys_auth");
 
   const sock = makeWASocket({
@@ -528,6 +691,21 @@ export async function iniciarWhatsapp(): Promise<void> {
         const numeroTelefono = fuenteTelefono.split("@")[0].split(":")[0];
         const responder = (t: string) => sock.sendMessage(jid, { text: t });
 
+        //Pausa de emergencia (ver botón del dashboard / ConfiguracionBot): si está
+        //pausado, no se procesa nada más, ni siquiera "reset" o un comprobante en curso.
+        if (!configuracionBot.activo) {
+          await responder(configuracionBot.mensajePausa);
+          return;
+        }
+
+        //Manda la imagen con los datos bancarios (cuenta RUT + logo Mercado Pago) al
+        //elegir transferencia. Se define acá porque necesita `sock`/`jid`, que
+        //manejarMensaje no tiene.
+        const enviarDatosBancarios = async () => {
+          if (!datosBancariosBuffer) return;
+          await sock.sendMessage(jid, { image: datosBancariosBuffer, caption: "🏦 Estos son nuestros datos para la transferencia." });
+        };
+
         //Comprobante de transferencia: es una imagen, no pasa por el filtro de solo-texto
         //de abajo. Se maneja acá (no en manejarMensaje) porque necesita `sock` para
         //descargar el archivo.
@@ -537,8 +715,13 @@ export async function iniciarWhatsapp(): Promise<void> {
             const buffer = await downloadMediaMessage(msg, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage });
             const mime = imagen.mimetype || "image/jpeg";
             comprobantesPendientes[numeroTelefono] = `data:${mime};base64,${buffer.toString("base64")}`;
-            estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
-            await responder("✅ Comprobante recibido.\n\n📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
+            if (modalidadesPendientes[numeroTelefono] === "delivery") {
+              estadosUsuarios[numeroTelefono] = "PIDIENDO_DIRECCION";
+              await responder("✅ Comprobante recibido.\n\n📍 Pásame tu dirección de entrega (calle, número, comuna).");
+            } else {
+              estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
+              await responder("✅ Comprobante recibido.\n\n📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
+            }
           } catch (e) {
             console.error("Error descargando comprobante de transferencia:", e);
             await responder("❌ No pude leer esa imagen, ¿puedes volver a enviarla?");
@@ -558,7 +741,7 @@ export async function iniciarWhatsapp(): Promise<void> {
         }
 
         const textoCliente = texto.trim();
-        await manejarMensaje(numeroTelefono, textoCliente, responder);
+        await manejarMensaje(numeroTelefono, textoCliente, responder, enviarDatosBancarios);
       })();
     }
   });

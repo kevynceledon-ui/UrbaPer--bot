@@ -65,6 +65,9 @@ export function OrderCard({ order, isNew, onDismiss, onNoLlego }: Props) {
           <div className="flex items-center gap-2">
             <span className="rounded-full bg-zinc-800 px-2 py-1 text-[11px] font-bold tracking-wide text-zinc-400">#{String(order.id).slice(0, 8)}</span>
             <span className="text-xs font-medium text-zinc-500">{formatHora(order.fecha)} · {formatFechaLarga(order.fecha)}</span>
+            {order.tiempoEstimadoMin != null && order.tiempoEstimadoMax != null && (
+              <span className="text-xs font-bold text-brand-300">⏱️ {order.tiempoEstimadoMin}-{order.tiempoEstimadoMax} min</span>
+            )}
           </div>
           <h3 className="mt-1 truncate text-[18px] font-extrabold leading-none text-white">{order.cliente.nombre}</h3>
           <a href={`tel:+${telIntl}`} className="text-sm font-medium text-zinc-400 underline decoration-dotted underline-offset-4">
@@ -76,6 +79,11 @@ export function OrderCard({ order, isNew, onDismiss, onNoLlego }: Props) {
           <span className="rounded-2xl bg-brand-500 px-3 py-1.5 text-sm font-black text-zinc-900">
             {formatCLP(order.total)}
           </span>
+          {order.modalidad && (
+            <span className="rounded-full bg-zinc-800 px-2.5 py-1 text-[11px] font-bold text-zinc-300">
+              {order.modalidad === 'delivery' ? '🛵 Delivery' : '🏪 Retiro'}
+            </span>
+          )}
           {order.metodoPago && (
             <span className="rounded-full bg-zinc-800 px-2.5 py-1 text-[11px] font-bold text-zinc-300">
               {order.metodoPago === 'efectivo' ? '💵 Efectivo' : '🏦 Transferencia'}
@@ -116,6 +124,14 @@ export function OrderCard({ order, isNew, onDismiss, onNoLlego }: Props) {
             </li>
           ))}
         </ul>
+        {order.direccion && (
+          <p className="mt-3 text-sm text-zinc-300">📍 {order.direccion}</p>
+        )}
+        {order.vuelto != null && (
+          <p className="mt-1 text-sm text-zinc-300">
+            💵 Paga con {formatCLP(order.montoRecibido ?? 0)} · vuelto {formatCLP(order.vuelto)}
+          </p>
+        )}
         {order.comprobanteImagen && (
           <a
             href={order.comprobanteImagen}

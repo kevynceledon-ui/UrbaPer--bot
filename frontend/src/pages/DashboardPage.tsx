@@ -9,8 +9,9 @@ import { useAudioUnlock } from '../hooks/useAudioUnlock'
 import { useOrdersSocket } from '../hooks/useOrdersSocket'
 import { useWhatsappStatus } from '../hooks/useWhatsappStatus'
 import { useClientesEsperando } from '../hooks/useClientesEsperando'
+import { useBotEstado } from '../hooks/useBotEstado'
 import { playNotificationSound } from '../utils/audio'
-import { verifyToken, reiniciarWhatsapp } from '../services/api'
+import { verifyToken, reiniciarWhatsapp, actualizarConfiguracion } from '../services/api'
 import { disconnectSocket } from '../services/socket'
 
 export function DashboardPage() {
@@ -26,12 +27,13 @@ export function DashboardPage() {
   const [shiftStarted, setShiftStarted] = useState(() => localStorage.getItem('shiftStarted') === '1')
 
   // WakeLock solo si el turno inició
-  const { isSupported: wakeSupported, isLocked: wakeLocked, error: wakeError } = useWakeLock(shiftStarted)
+  const { isSupported: wakeSupported, isLocked: wakeLocked, error: wakeError, request: requestWakeLock } = useWakeLock(shiftStarted)
 
   // Socket solo si hay token
   const { orders, lastOrder, connectionState, removeOrder, marcarNoLlego, disconnect } = useOrdersSocket(token, audioUnlocked)
   const { qr: whatsappQr } = useWhatsappStatus(token)
   const { clientes: clientesEsperando, devolverAlBot } = useClientesEsperando(token)
+  const { activo: botActivo, setActivo: setBotActivo, mensajePausa, setMensajePausa } = useBotEstado(token)
   const [highlightId, setHighlightId] = useState<string | number | null>(null)
 
   // Resalta la tarjeta del último pedido real recibido por socket ("¡NUEVO!")
@@ -59,12 +61,16 @@ export function DashboardPage() {
   }, [token, nav])
 
   const handleStartShift = useCallback(async () => {
+    // Wake Lock primero, sin ningún `await` antes: Safari es estricto con la
+    // "user activation" del tap y puede rechazar wakeLock.request() si llega
+    // después de esperar el desbloqueo de audio (ver useWakeLock.ts).
+    void requestWakeLock()
     await unlock()
     // Se inicia igual aunque falle el desbloqueo de audio (el banner de "Sonido
     // bloqueado" permite reintentarlo desde el dashboard).
     localStorage.setItem('shiftStarted', '1')
     setShiftStarted(true)
-  }, [unlock])
+  }, [unlock, requestWakeLock])
 
   const handleLogout = useCallback(() => {
     disconnect()
@@ -91,6 +97,39 @@ export function DashboardPage() {
       setReiniciando(false)
     }
   }, [token])
+
+  // Pausa de emergencia: corta las respuestas automáticas del bot sin redeploy.
+  // Mientras está pausado, el bot responde siempre `mensajePausa` a cualquier
+  // mensaje entrante (ver ConfiguracionBot / whatsappServices.ts).
+  const [cambiandoPausa, setCambiandoPausa] = useState(false)
+  const handleTogglePausa = useCallback(async () => {
+    if (!token) return
+    const nuevoActivo = !botActivo
+    if (!nuevoActivo && !window.confirm('El bot dejará de responder automáticamente a los clientes hasta que lo reactives. ¿Continuar?')) return
+    setCambiandoPausa(true)
+    try {
+      const cfg = await actualizarConfiguracion(token, { activo: nuevoActivo })
+      setBotActivo(cfg.activo)
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : 'No se pudo cambiar el estado del bot')
+    } finally {
+      setCambiandoPausa(false)
+    }
+  }, [token, botActivo, setBotActivo])
+
+  const [guardandoMensaje, setGuardandoMensaje] = useState(false)
+  const handleGuardarMensajePausa = useCallback(async () => {
+    if (!token) return
+    setGuardandoMensaje(true)
+    try {
+      await actualizarConfiguracion(token, { mensajePausa })
+      window.alert('Mensaje de pausa guardado.')
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : 'No se pudo guardar el mensaje')
+    } finally {
+      setGuardandoMensaje(false)
+    }
+  }, [token, mensajePausa])
 
   const botonReiniciar = (
     <button
@@ -226,6 +265,58 @@ export function DashboardPage() {
         {!qrBanner && (
           <div className="mb-4 text-center">{botonReiniciar}</div>
         )}
+
+        {/* Pausa de emergencia: si está pausado, se muestra siempre arriba de todo
+            para que el equipo no se olvide de reactivarlo. */}
+        {!botActivo && (
+          <div role="alert" className="mb-4 rounded-2xl border border-red-500/40 bg-red-500/10 px-4 py-3 flex items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-black text-red-300">⏸ Bot pausado</p>
+              <p className="text-xs text-red-300/70">Los clientes reciben el mensaje automático, no se están tomando pedidos.</p>
+            </div>
+            <button
+              onClick={handleTogglePausa}
+              disabled={cambiandoPausa}
+              className="shrink-0 rounded-full bg-red-500 px-3 py-1.5 text-xs font-black text-zinc-900 disabled:opacity-50"
+            >
+              {cambiandoPausa ? '…' : 'Reactivar'}
+            </button>
+          </div>
+        )}
+
+        <details className="mb-4 rounded-2xl border border-zinc-800 bg-zinc-900/60 px-4 py-3">
+          <summary className="cursor-pointer text-xs font-bold tracking-widest text-zinc-500 uppercase select-none">
+            Configuración del bot
+          </summary>
+          <div className="mt-3 space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-sm text-zinc-300">{botActivo ? 'Tomando pedidos' : 'Pausado'}</span>
+              <button
+                onClick={handleTogglePausa}
+                disabled={cambiandoPausa}
+                className={`rounded-full px-4 py-1.5 text-xs font-black transition disabled:opacity-50 ${botActivo ? 'bg-zinc-800 text-zinc-300 border border-zinc-700' : 'bg-red-500 text-zinc-900'}`}
+              >
+                {cambiandoPausa ? '…' : botActivo ? 'Pausar bot' : 'Pausado'}
+              </button>
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-zinc-500 mb-1">Mensaje mientras está pausado</label>
+              <textarea
+                value={mensajePausa}
+                onChange={(e) => setMensajePausa(e.target.value)}
+                rows={2}
+                className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200"
+              />
+              <button
+                onClick={handleGuardarMensajePausa}
+                disabled={guardandoMensaje}
+                className="mt-2 rounded-full bg-brand-500 px-3 py-1.5 text-xs font-black text-zinc-900 disabled:opacity-50"
+              >
+                {guardandoMensaje ? 'Guardando…' : 'Guardar mensaje'}
+              </button>
+            </div>
+          </div>
+        </details>
 
         {/* Barra acciones */}
         <div className="flex items-center justify-between gap-2 mb-3">

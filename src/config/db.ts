@@ -106,6 +106,15 @@ class Pedido extends Model<InferAttributes<Pedido>, InferCreationAttributes<Pedi
   //equipo en el dashboard — no hay verificación automática de que la plata haya
   //llegado de verdad (ver plan de "método de pago + pedidos fantasma").
   declare comprobanteImagen: CreationOptional<string | null>;
+  //Campos nullable: pedidos anteriores a este cambio no los tienen.
+  declare modalidad: CreationOptional<"delivery" | "retiro" | null>;
+  declare direccion: CreationOptional<string | null>;
+  //Con qué billete pagó (para calcular el vuelto al vuelo, no se persiste el vuelto).
+  declare montoRecibido: CreationOptional<number | null>;
+  //Congelados al momento de crear el pedido: no se recalculan después aunque
+  //cambie la cola (ver calcularTiempoEstimado en whatsappServices.ts).
+  declare tiempoEstimadoMin: CreationOptional<number | null>;
+  declare tiempoEstimadoMax: CreationOptional<number | null>;
   declare cliente_id: ForeignKey<Cliente["id"]>;
   declare createdAt: CreationOptional<Date>;
   declare updatedAt: CreationOptional<Date>;
@@ -142,6 +151,31 @@ Pedido.init(
     },
     comprobanteImagen: {
       type: DataTypes.TEXT,
+      allowNull: true,
+      defaultValue: null,
+    },
+    modalidad: {
+      type: DataTypes.ENUM("delivery", "retiro"),
+      allowNull: true,
+      defaultValue: null,
+    },
+    direccion: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+      defaultValue: null,
+    },
+    montoRecibido: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      defaultValue: null,
+    },
+    tiempoEstimadoMin: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      defaultValue: null,
+    },
+    tiempoEstimadoMax: {
+      type: DataTypes.INTEGER,
       allowNull: true,
       defaultValue: null,
     },
@@ -182,6 +216,43 @@ DetallePedido.init(
   { sequelize, modelName: "DetallePedido" }
 );
 
+//ID fijo de la única fila de ConfiguracionBot. findOrCreate() necesita una
+//condición que choque contra un constraint único de verdad para poder detectar
+//una carrera entre dos llamadas concurrentes (boot del bot + GET/PATCH); con
+//`where: {}` (sin columnas únicas) dos inserts concurrentes podían colarse como
+//dos filas distintas, sin que Sequelize lo detectara.
+const CONFIGURACION_BOT_ID = "00000000-0000-0000-0000-000000000001";
+
+//Fila única: pausa de emergencia del bot desde el dashboard (ver botón "Pausar
+//bot" y whatsappServices.ts). Sin cliente_id ni relaciones porque es config
+//global, no algo por cliente/pedido.
+class ConfiguracionBot extends Model<InferAttributes<ConfiguracionBot>, InferCreationAttributes<ConfiguracionBot>> {
+  declare id: CreationOptional<string>;
+  declare activo: CreationOptional<boolean>;
+  declare mensajePausa: CreationOptional<string>;
+}
+
+ConfiguracionBot.init(
+  {
+    id: {
+      type: DataTypes.UUID,
+      defaultValue: DataTypes.UUIDV4,
+      primaryKey: true,
+    },
+    activo: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: true,
+    },
+    mensajePausa: {
+      type: DataTypes.TEXT,
+      allowNull: false,
+      defaultValue: "En este momento no estamos tomando pedidos por este medio. Por favor intenta más tarde o comunícate directamente con el local.",
+    },
+  },
+  { sequelize, modelName: "ConfiguracionBot" }
+);
+
 //Relaciones
 //Cliente a muchos pedidos
 Cliente.hasMany(Pedido, { foreignKey: "cliente_id" });
@@ -206,4 +277,4 @@ DetallePedido.belongsTo(Producto, { foreignKey: "producto_id" });
   }
 })();
 
-export { sequelize, Cliente, Producto, Pedido, DetallePedido };
+export { sequelize, Cliente, Producto, Pedido, DetallePedido, ConfiguracionBot, CONFIGURACION_BOT_ID };

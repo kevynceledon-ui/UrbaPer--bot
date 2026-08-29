@@ -3,13 +3,25 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 export function useWakeLock(enabled: boolean) {
   const sentinelRef = useRef<any>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  // Evita llamadas reentrantes: el tap de "Iniciar Turno" pide el lock directo Y
+  // el efecto de abajo lo vuelve a pedir al reaccionar al cambio de `enabled` un
+  // tick después — sin este guard, ambas llamadas compiten por el mismo
+  // videoRef.current y una interrumpe el play() de la otra.
+  const requestingRef = useRef(false)
   const [isLocked, setIsLocked] = useState(false)
   const [isFallback, setIsFallback] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // No depende de `enabled`: se llama tanto desde el efecto de abajo (mount /
+  // volver de background) como directamente desde el gesto de click de "Iniciar
+  // Turno" (ver DashboardPage). Safari es estricto con la "user activation" de
+  // wakeLock.request(): si se llama después de otros `await` (audio, setState +
+  // render), puede rechazarla aunque haya sido un tap real. Por eso el botón la
+  // pide ANTES de esperar el desbloqueo de audio, no solo vía este efecto.
   const request = useCallback(async () => {
-    if (!enabled) return
-
+    if (requestingRef.current) return
+    requestingRef.current = true
+    try {
     // 1. Intentar API nativa (requiere Secure Context: HTTPS o localhost)
     const hasNative = typeof navigator !== 'undefined' && 'wakeLock' in navigator && window.isSecureContext
     if (hasNative) {
@@ -31,13 +43,23 @@ export function useWakeLock(enabled: boolean) {
       }
     }
 
-    // 2. Fallback por Video Loop (funciona en HTTP LAN / móviles sin HTTPS)
+    // 2. Fallback por Video Loop, para navegadores sin la API nativa (ej. Safari
+    // < 16.4). El video sale de canvas.captureStream() (generado en el momento,
+    // sin depender de bytes de un archivo de video hardcodeados: un intento
+    // anterior con un blob WebM escrito a mano estaba corrupto/incompleto y
+    // fallaba siempre con "no supported source was found", incluso en Chrome).
     try {
       if (!videoRef.current) {
+        const canvas = document.createElement('canvas')
+        canvas.width = 1
+        canvas.height = 1
+        canvas.getContext('2d')?.fillRect(0, 0, 1, 1)
+        const stream = canvas.captureStream(1)
+
         const video = document.createElement('video')
         video.setAttribute('playsinline', '')
-        video.setAttribute('muted', '')
-        video.setAttribute('loop', '')
+        video.muted = true
+        video.srcObject = stream
         video.width = 1
         video.height = 1
         video.style.position = 'fixed'
@@ -46,16 +68,6 @@ export function useWakeLock(enabled: boolean) {
         video.style.opacity = '0.001'
         video.style.pointerEvents = 'none'
         video.style.zIndex = '-9999'
-
-        // Tiny transparent video webm blob
-        const webmBytes = new Uint8Array([
-          0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42, 0x86, 0x81, 0x01, 0x42, 0xf7, 0x81, 0x01, 0x42, 0xf2, 0x81,
-          0x04, 0x42, 0xf3, 0x81, 0x08, 0x42, 0x82, 0x84, 0x76, 0x70, 0xeb, 0x6d, 0x18, 0x53, 0x80, 0x67,
-          0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d, 0x16, 0x54, 0xae, 0x6b, 0x81, 0x00, 0xae, 0x42,
-          0x85, 0x81, 0x01, 0x42, 0x87, 0x81, 0x01, 0x1f, 0x43, 0xb6, 0x75, 0x81, 0x01, 0xec, 0x81, 0x00
-        ])
-        const blob = new Blob([webmBytes], { type: 'video/webm' })
-        video.src = URL.createObjectURL(blob)
         document.body.appendChild(video)
         videoRef.current = video
       }
@@ -64,13 +76,16 @@ export function useWakeLock(enabled: boolean) {
       setIsLocked(true)
       setIsFallback(true)
       setError(null)
-      console.log('[WakeLock] Fallback video activo ✓ (HTTP LAN)')
+      console.log('[WakeLock] Fallback video activo ✓')
     } catch (e: any) {
       console.warn('[WakeLock] Fallback video falló:', e?.message)
       setError(e?.message ?? 'No se pudo activar Wake Lock')
       setIsLocked(false)
     }
-  }, [enabled])
+    } finally {
+      requestingRef.current = false
+    }
+  }, [])
 
   const release = useCallback(async () => {
     if (sentinelRef.current && !sentinelRef.current.released) {
@@ -80,6 +95,8 @@ export function useWakeLock(enabled: boolean) {
     if (videoRef.current) {
       try {
         videoRef.current.pause()
+        const stream = videoRef.current.srcObject as MediaStream | null
+        stream?.getTracks().forEach((t) => t.stop())
         videoRef.current.remove()
       } catch {}
       videoRef.current = null

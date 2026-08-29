@@ -11,6 +11,7 @@ export interface OrderItem {
 }
 
 export type MetodoPago = 'efectivo' | 'transferencia'
+export type Modalidad = 'delivery' | 'retiro'
 
 export interface Order {
   id: string | number
@@ -21,6 +22,12 @@ export interface Order {
   metodoPago?: MetodoPago | null
   comprobanteImagen?: string | null
   clienteNoShows?: number
+  modalidad?: Modalidad | null
+  direccion?: string | null
+  montoRecibido?: number | null
+  vuelto?: number | null
+  tiempoEstimadoMin?: number | null
+  tiempoEstimadoMax?: number | null
   fecha: string // ISO string
 }
 

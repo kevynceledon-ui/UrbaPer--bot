@@ -56,6 +56,12 @@ router.get("/pedidos", authenticateToken, async (_req, res) => {
       metodoPago: p.metodoPago ?? null,
       comprobanteImagen: p.comprobanteImagen ?? null,
       clienteNoShows: noShowsPorCliente.get(p.cliente_id) ?? 0,
+      modalidad: p.modalidad ?? null,
+      direccion: p.direccion ?? null,
+      montoRecibido: p.montoRecibido ?? null,
+      vuelto: p.montoRecibido != null ? p.montoRecibido - p.total : null,
+      tiempoEstimadoMin: p.tiempoEstimadoMin ?? null,
+      tiempoEstimadoMax: p.tiempoEstimadoMax ?? null,
       fecha: p.createdAt.toISOString(),
     }));
 
