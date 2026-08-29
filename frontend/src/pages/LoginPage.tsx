@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useNavigate, Navigate } from 'react-router-dom'
+import { Eye, EyeOff, AlertTriangle, ArrowRight } from 'lucide-react'
 import { login } from '../services/api'
 
 export function LoginPage() {
@@ -93,26 +94,27 @@ export function LoginPage() {
                   <button
                     type="button"
                     onClick={() => setShowPass(v => !v)}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 rounded-xl bg-zinc-900 px-2.5 py-1.5 text-xs font-bold text-zinc-400 border border-zinc-800"
+                    className="absolute right-2 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-xl border border-zinc-800 bg-zinc-900 text-zinc-400 transition hover:text-zinc-200"
                     aria-label={showPass ? 'Ocultar contraseña' : 'Mostrar contraseña'}
                   >
-                    {showPass ? 'Ocultar' : 'Ver'}
+                    {showPass ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                   </button>
                 </div>
               </div>
 
               {error && (
-                <div role="alert" className="animate-shake rounded-2xl border border-red-900/50 bg-red-950/50 px-4 py-3 text-sm font-medium text-red-300">
-                  ⚠️ {error}
+                <div role="alert" className="animate-shake flex items-start gap-2 rounded-2xl border border-red-900/50 bg-red-950/50 px-4 py-3 text-sm font-medium text-red-300">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  {error}
                 </div>
               )}
 
               <button
                 type="submit"
                 disabled={loading}
-                className="w-full rounded-2xl bg-brand-500 px-4 py-3.5 text-[16px] font-black text-zinc-900 shadow-lg shadow-black/30 active:scale-[0.98] disabled:opacity-60 disabled:cursor-not-allowed transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-400/40"
+                className="flex w-full items-center justify-center gap-2 rounded-2xl bg-brand-500 px-4 py-3.5 text-[16px] font-black text-zinc-900 shadow-lg shadow-black/30 transition active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-400/40"
               >
-                {loading ? 'Verificando…' : 'Entrar →'}
+                {loading ? 'Verificando…' : (<>Entrar <ArrowRight className="h-4 w-4" /></>)}
               </button>
 
               <p className="text-center text-xs leading-relaxed text-zinc-500">
