@@ -28,6 +28,7 @@ export interface Order {
   vuelto?: number | null
   tiempoEstimadoMin?: number | null
   tiempoEstimadoMax?: number | null
+  horaProgramada?: string | null // ISO string, solo si es un pedido agendado (ver ADR-002)
   fecha: string // ISO string
 }
 

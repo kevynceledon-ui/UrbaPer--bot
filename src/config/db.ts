@@ -65,11 +65,44 @@ Cliente.init(
   { sequelize, modelName: "Cliente" }
 );
 
+//Agrupa los productos del menú (ver ELIGIENDO_CATEGORIA en whatsappServices.ts).
+class Categoria extends Model<InferAttributes<Categoria>, InferCreationAttributes<Categoria>> {
+  declare id: CreationOptional<string>;
+  declare nombre: string;
+  declare orden: CreationOptional<number>;
+}
+
+Categoria.init(
+  {
+    id: {
+      type: DataTypes.UUID,
+      defaultValue: DataTypes.UUIDV4,
+      primaryKey: true,
+    },
+    nombre: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    orden: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
+    },
+  },
+  { sequelize, modelName: "Categoria" }
+);
+
 class Producto extends Model<InferAttributes<Producto>, InferCreationAttributes<Producto>> {
   declare id: CreationOptional<string>;
   declare nombre: string;
   declare precio: number;
   declare disponible: CreationOptional<boolean>;
+  //Nullable: productos de pedidos históricos (antes del menú por categorías) se
+  //quedan sin categoría — invisibles en el menú nuevo, pero no rompen DetallePedido.
+  declare categoriaId: ForeignKey<Categoria["id"]> | null;
+  //Orden dentro de su categoría en el listado del bot (no estaba en el pedido
+  //original, pero hace falta para que el orden no dependa del azar de la DB).
+  declare orden: CreationOptional<number>;
 }
 
 Producto.init(
@@ -90,6 +123,16 @@ Producto.init(
     disponible: {
       type: DataTypes.BOOLEAN,
       defaultValue: true,
+    },
+    categoriaId: {
+      type: DataTypes.UUID,
+      allowNull: true,
+      defaultValue: null,
+    },
+    orden: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
     },
   },
   { sequelize, modelName: "Producto" }
@@ -115,6 +158,9 @@ class Pedido extends Model<InferAttributes<Pedido>, InferCreationAttributes<Pedi
   //cambie la cola (ver calcularTiempoEstimado en whatsappServices.ts).
   declare tiempoEstimadoMin: CreationOptional<number | null>;
   declare tiempoEstimadoMax: CreationOptional<number | null>;
+  //null = pedido en tiempo real. Con valor = pedido agendado fuera de horario,
+  //comprometido para esa hora exacta (ver ADR-002 / ELIGIENDO_HORA_PROGRAMADA).
+  declare horaProgramada: CreationOptional<Date | null>;
   declare cliente_id: ForeignKey<Cliente["id"]>;
   declare createdAt: CreationOptional<Date>;
   declare updatedAt: CreationOptional<Date>;
@@ -179,6 +225,11 @@ Pedido.init(
       allowNull: true,
       defaultValue: null,
     },
+    horaProgramada: {
+      type: DataTypes.DATE,
+      allowNull: true,
+      defaultValue: null,
+    },
     createdAt: DataTypes.DATE,
     updatedAt: DataTypes.DATE,
   },
@@ -230,6 +281,11 @@ class ConfiguracionBot extends Model<InferAttributes<ConfiguracionBot>, InferCre
   declare id: CreationOptional<string>;
   declare activo: CreationOptional<boolean>;
   declare mensajePausa: CreationOptional<string>;
+  //Tamaño de cada franja horaria ofrecida al agendar (ver ADR-002).
+  declare duracionFranjaMin: CreationOptional<number>;
+  //Cuántos pedidos programados caben en la misma franja. Valor temporal (1) hasta
+  //que la dueña confirme cuántos puede tener listos en paralelo.
+  declare capacidadPorFranja: CreationOptional<number>;
 }
 
 ConfiguracionBot.init(
@@ -249,8 +305,54 @@ ConfiguracionBot.init(
       allowNull: false,
       defaultValue: "En este momento no estamos tomando pedidos por este medio. Por favor intenta más tarde o comunícate directamente con el local.",
     },
+    duracionFranjaMin: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 15,
+    },
+    capacidadPorFranja: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 1,
+    },
   },
   { sequelize, modelName: "ConfiguracionBot" }
+);
+
+//Horario real de atención, usado para decidir si el bot puede tomar pedidos en
+//tiempo real o debe ofrecer agendar (ver ADR-002 / src/utils/horario.ts). Puede
+//haber más de una fila por día (turno partido); un día sin filas = cerrado.
+class HorarioAtencion extends Model<InferAttributes<HorarioAtencion>, InferCreationAttributes<HorarioAtencion>> {
+  declare id: CreationOptional<string>;
+  //Convención Date.getDay(): 0=Domingo … 6=Sábado.
+  declare diaSemana: number;
+  //"HH:MM" 24h — string simple en vez de TIME de Postgres, para comparar con
+  //</> directamente sin lidiar con casts de zona horaria.
+  declare horaInicio: string;
+  declare horaFin: string;
+}
+
+HorarioAtencion.init(
+  {
+    id: {
+      type: DataTypes.UUID,
+      defaultValue: DataTypes.UUIDV4,
+      primaryKey: true,
+    },
+    diaSemana: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+    },
+    horaInicio: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+    horaFin: {
+      type: DataTypes.STRING,
+      allowNull: false,
+    },
+  },
+  { sequelize, modelName: "HorarioAtencion" }
 );
 
 //Relaciones
@@ -266,6 +368,10 @@ DetallePedido.belongsTo(Pedido, { foreignKey: "pedido_id" });
 Producto.hasMany(DetallePedido, { foreignKey: "producto_id" });
 DetallePedido.belongsTo(Producto, { foreignKey: "producto_id" });
 
+//una categoría agrupa muchos productos
+Categoria.hasMany(Producto, { foreignKey: "categoriaId" });
+Producto.belongsTo(Categoria, { foreignKey: "categoriaId" });
+
 //Sincronización y exportación
 (async () => {
   try {
@@ -277,4 +383,14 @@ DetallePedido.belongsTo(Producto, { foreignKey: "producto_id" });
   }
 })();
 
-export { sequelize, Cliente, Producto, Pedido, DetallePedido, ConfiguracionBot, CONFIGURACION_BOT_ID };
+export {
+  sequelize,
+  Cliente,
+  Producto,
+  Pedido,
+  DetallePedido,
+  ConfiguracionBot,
+  CONFIGURACION_BOT_ID,
+  Categoria,
+  HorarioAtencion,
+};

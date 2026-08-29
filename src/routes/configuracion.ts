@@ -17,7 +17,13 @@ router.get("/configuracion", authenticateToken, async (_req, res) => {
       where: { id: CONFIGURACION_BOT_ID },
       defaults: { id: CONFIGURACION_BOT_ID },
     });
-    return res.json({ ok: true, activo: fila.activo, mensajePausa: fila.mensajePausa });
+    return res.json({
+      ok: true,
+      activo: fila.activo,
+      mensajePausa: fila.mensajePausa,
+      duracionFranjaMin: fila.duracionFranjaMin,
+      capacidadPorFranja: fila.capacidadPorFranja,
+    });
   } catch (error) {
     console.error("Error al leer la configuración del bot:", error);
     return res.status(500).json({ ok: false, error: "No se pudo cargar la configuración" });
@@ -27,6 +33,10 @@ router.get("/configuracion", authenticateToken, async (_req, res) => {
 const configuracionSchema = z.object({
   activo: z.boolean().optional(),
   mensajePausa: z.string().min(1).optional(),
+  //Franjas de agenda fuera de horario (ver ADR-002). Valores temporales hasta
+  //que la dueña confirme cuántos pedidos puede tener listos en paralelo.
+  duracionFranjaMin: z.number().int().positive().optional(),
+  capacidadPorFranja: z.number().int().positive().optional(),
 });
 
 /**
@@ -56,7 +66,13 @@ router.patch("/configuracion", authenticateToken, async (req, res) => {
       console.warn("[Socket.IO] No se pudo emitir bot_estado:", e instanceof Error ? e.message : e);
     }
 
-    return res.json({ ok: true, activo: fila.activo, mensajePausa: fila.mensajePausa });
+    return res.json({
+      ok: true,
+      activo: fila.activo,
+      mensajePausa: fila.mensajePausa,
+      duracionFranjaMin: fila.duracionFranjaMin,
+      capacidadPorFranja: fila.capacidadPorFranja,
+    });
   } catch (error) {
     console.error("Error al actualizar la configuración del bot:", error);
     return res.status(500).json({ ok: false, error: "No se pudo actualizar la configuración" });

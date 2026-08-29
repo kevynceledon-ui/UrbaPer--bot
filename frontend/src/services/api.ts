@@ -74,6 +74,19 @@ export async function getPedidosActivos(token: string): Promise<import('../types
   return data.pedidos
 }
 
+//Pedidos agendados fuera de horario (ver ADR-002) cuya hora todavía no llega —
+//sección separada del dashboard, no se mezclan con los pedidos activos de ahora.
+export async function getPedidosProgramados(token: string): Promise<import('../types/order').Order[]> {
+  const res = await fetch(`${API_URL}/api/pedidos/programados`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  const data = await res.json()
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error ?? 'No se pudieron cargar los pedidos programados')
+  }
+  return data.pedidos
+}
+
 export type EstadoPedido = 'comprando' | 'pendiente' | 'preparando' | 'listo' | 'entregado' | 'cancelado'
 
 export async function actualizarEstadoPedido(id: string | number, estado: EstadoPedido, token: string): Promise<void> {
@@ -136,6 +149,18 @@ export async function reiniciarWhatsapp(token: string): Promise<void> {
 export interface ConfiguracionBot {
   activo: boolean
   mensajePausa: string
+  //Franjas de agenda fuera de horario (ver ADR-002).
+  duracionFranjaMin: number
+  capacidadPorFranja: number
+}
+
+function mapearConfiguracion(data: any): ConfiguracionBot {
+  return {
+    activo: data.activo,
+    mensajePausa: data.mensajePausa,
+    duracionFranjaMin: data.duracionFranjaMin,
+    capacidadPorFranja: data.capacidadPorFranja,
+  }
 }
 
 //Botón de pausa/emergencia: corta las respuestas automáticas del bot.
@@ -147,7 +172,7 @@ export async function getConfiguracion(token: string): Promise<ConfiguracionBot>
   if (!res.ok || !data.ok) {
     throw new Error(data.error ?? 'No se pudo cargar la configuración')
   }
-  return { activo: data.activo, mensajePausa: data.mensajePausa }
+  return mapearConfiguracion(data)
 }
 
 export async function actualizarConfiguracion(
@@ -163,5 +188,5 @@ export async function actualizarConfiguracion(
   if (!res.ok || !data.ok) {
     throw new Error(data.error ?? 'No se pudo actualizar la configuración')
   }
-  return { activo: data.activo, mensajePausa: data.mensajePausa }
+  return mapearConfiguracion(data)
 }

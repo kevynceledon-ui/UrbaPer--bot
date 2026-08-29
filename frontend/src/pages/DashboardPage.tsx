@@ -10,6 +10,7 @@ import { useOrdersSocket } from '../hooks/useOrdersSocket'
 import { useWhatsappStatus } from '../hooks/useWhatsappStatus'
 import { useClientesEsperando } from '../hooks/useClientesEsperando'
 import { useBotEstado } from '../hooks/useBotEstado'
+import { usePedidosProgramados } from '../hooks/usePedidosProgramados'
 import { playNotificationSound } from '../utils/audio'
 import { verifyToken, reiniciarWhatsapp, actualizarConfiguracion } from '../services/api'
 import { disconnectSocket } from '../services/socket'
@@ -33,7 +34,17 @@ export function DashboardPage() {
   const { orders, lastOrder, connectionState, removeOrder, marcarNoLlego, disconnect } = useOrdersSocket(token, audioUnlocked)
   const { qr: whatsappQr } = useWhatsappStatus(token)
   const { clientes: clientesEsperando, devolverAlBot } = useClientesEsperando(token)
-  const { activo: botActivo, setActivo: setBotActivo, mensajePausa, setMensajePausa } = useBotEstado(token)
+  const {
+    activo: botActivo,
+    setActivo: setBotActivo,
+    mensajePausa,
+    setMensajePausa,
+    duracionFranjaMin,
+    setDuracionFranjaMin,
+    capacidadPorFranja,
+    setCapacidadPorFranja,
+  } = useBotEstado(token)
+  const { pedidos: pedidosProgramados } = usePedidosProgramados(token)
   const [highlightId, setHighlightId] = useState<string | number | null>(null)
 
   // Resalta la tarjeta del último pedido real recibido por socket ("¡NUEVO!")
@@ -118,18 +129,18 @@ export function DashboardPage() {
   }, [token, botActivo, setBotActivo])
 
   const [guardandoMensaje, setGuardandoMensaje] = useState(false)
-  const handleGuardarMensajePausa = useCallback(async () => {
+  const handleGuardarConfiguracion = useCallback(async () => {
     if (!token) return
     setGuardandoMensaje(true)
     try {
-      await actualizarConfiguracion(token, { mensajePausa })
-      window.alert('Mensaje de pausa guardado.')
+      await actualizarConfiguracion(token, { mensajePausa, duracionFranjaMin, capacidadPorFranja })
+      window.alert('Configuración guardada.')
     } catch (e) {
-      window.alert(e instanceof Error ? e.message : 'No se pudo guardar el mensaje')
+      window.alert(e instanceof Error ? e.message : 'No se pudo guardar la configuración')
     } finally {
       setGuardandoMensaje(false)
     }
-  }, [token, mensajePausa])
+  }, [token, mensajePausa, duracionFranjaMin, capacidadPorFranja])
 
   const botonReiniciar = (
     <button
@@ -307,16 +318,51 @@ export function DashboardPage() {
                 rows={2}
                 className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200"
               />
-              <button
-                onClick={handleGuardarMensajePausa}
-                disabled={guardandoMensaje}
-                className="mt-2 rounded-full bg-brand-500 px-3 py-1.5 text-xs font-black text-zinc-900 disabled:opacity-50"
-              >
-                {guardandoMensaje ? 'Guardando…' : 'Guardar mensaje'}
-              </button>
             </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-bold text-zinc-500 mb-1">Franja de agenda (min)</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={duracionFranjaMin}
+                  onChange={(e) => setDuracionFranjaMin(Number(e.target.value) || 1)}
+                  className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-zinc-500 mb-1">Cupo por franja</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={capacidadPorFranja}
+                  onChange={(e) => setCapacidadPorFranja(Number(e.target.value) || 1)}
+                  className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200"
+                />
+              </div>
+            </div>
+            <button
+              onClick={handleGuardarConfiguracion}
+              disabled={guardandoMensaje}
+              className="rounded-full bg-brand-500 px-3 py-1.5 text-xs font-black text-zinc-900 disabled:opacity-50"
+            >
+              {guardandoMensaje ? 'Guardando…' : 'Guardar configuración'}
+            </button>
           </div>
         </details>
+
+        {/* Pedidos agendados fuera de horario (ver ADR-002): sección separada,
+            no se mezclan con "Pedidos activos" hasta que llegue su hora. */}
+        {pedidosProgramados.length > 0 && (
+          <div className="mb-4 space-y-2">
+            <h2 className="text-[11px] font-bold tracking-[0.18em] text-brand-300 uppercase">
+              Pedidos programados · {pedidosProgramados.length}
+            </h2>
+            {pedidosProgramados.map((o) => (
+              <OrderCard key={String(o.id)} order={o} />
+            ))}
+          </div>
+        )}
 
         {/* Barra acciones */}
         <div className="flex items-center justify-between gap-2 mb-3">

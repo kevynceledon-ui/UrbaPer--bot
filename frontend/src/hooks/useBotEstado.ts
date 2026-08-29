@@ -6,6 +6,10 @@ import { getConfiguracion } from '../services/api'
 export function useBotEstado(token: string | null) {
   const [activo, setActivo] = useState(true)
   const [mensajePausa, setMensajePausa] = useState('')
+  // Franjas de agenda fuera de horario (ver ADR-002). Valores temporales hasta
+  // que la dueña confirme cuántos pedidos puede tener listos en paralelo.
+  const [duracionFranjaMin, setDuracionFranjaMin] = useState(15)
+  const [capacidadPorFranja, setCapacidadPorFranja] = useState(1)
 
   // Estado inicial vía HTTP: sobrevive a un recargo de página, igual que
   // getPedidosActivos/getClientesEsperando.
@@ -15,6 +19,8 @@ export function useBotEstado(token: string | null) {
       .then((c) => {
         setActivo(c.activo)
         setMensajePausa(c.mensajePausa)
+        setDuracionFranjaMin(c.duracionFranjaMin)
+        setCapacidadPorFranja(c.capacidadPorFranja)
       })
       .catch((e) => console.warn('No se pudo cargar la configuración del bot:', e))
   }, [token])
@@ -33,5 +39,14 @@ export function useBotEstado(token: string | null) {
     }
   }, [token])
 
-  return { activo, setActivo, mensajePausa, setMensajePausa }
+  return {
+    activo,
+    setActivo,
+    mensajePausa,
+    setMensajePausa,
+    duracionFranjaMin,
+    setDuracionFranjaMin,
+    capacidadPorFranja,
+    setCapacidadPorFranja,
+  }
 }

@@ -68,6 +68,9 @@ export function OrderCard({ order, isNew, onDismiss, onNoLlego }: Props) {
             {order.tiempoEstimadoMin != null && order.tiempoEstimadoMax != null && (
               <span className="text-xs font-bold text-brand-300">⏱️ {order.tiempoEstimadoMin}-{order.tiempoEstimadoMax} min</span>
             )}
+            {order.horaProgramada && (
+              <span className="text-xs font-bold text-brand-300">🗓️ Agendado {formatHora(order.horaProgramada)}</span>
+            )}
           </div>
           <h3 className="mt-1 truncate text-[18px] font-extrabold leading-none text-white">{order.cliente.nombre}</h3>
           <a href={`tel:+${telIntl}`} className="text-sm font-medium text-zinc-400 underline decoration-dotted underline-offset-4">

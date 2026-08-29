@@ -11,15 +11,28 @@ import { rm } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { Op } from "sequelize";
+import { estaAbierto, calcularFranjasDisponibles, horaChileAFecha, formatHoraChile } from "../utils/horario.js";
 
 //Memoria temporal.
 const estadosUsuarios: Record<string, string> = {};
 
 interface CarritoItem {
+  productoId: string;
   nombre: string;
   precio: number;
 }
 const carritos: Record<string, CarritoItem[]> = {};
+//Último listado de códigos mostrado a cada cliente (categoría elegida o "ver todo
+//el menú"), mapeando el número que escribe (1, 2, 3…) al producto real. Se
+//sobreescribe cada vez que se muestra un listado nuevo (ver ELIGIENDO_CATEGORIA).
+const menuActualPendiente: Record<string, Record<string, CarritoItem>> = {};
+//Pedidos agendados fuera de horario (ver ADR-002): si el cliente aceptó agendar,
+//se le pregunta la hora después de la modalidad en vez de ir directo al pago.
+//`franjasPendientes` cachea el listado exacto mostrado, para que elegir "3"
+//siempre mapee al mismo horario aunque la disponibilidad cambie mientras responde.
+const pedidosProgramadosPendientes: Record<string, boolean> = {};
+const franjasPendientes: Record<string, { inicio: string; fin: string }[]> = {};
+const horaProgramadaPendientes: Record<string, Date> = {};
 //Nota de alergias/instrucciones especiales pendiente de confirmar (ver estado
 //PIDIENDO_NOTA / CONFIRMANDO_PEDIDO).
 const notasPendientes: Record<string, string> = {};
@@ -37,11 +50,26 @@ const direccionesPendientes: Record<string, string> = {};
 const montosRecibidosPendientes: Record<string, number> = {};
 
 //Import de las tablas
-import { Cliente, Pedido, Producto, DetallePedido, ConfiguracionBot, CONFIGURACION_BOT_ID } from "../config/db.js";
+import { Cliente, Pedido, Producto, DetallePedido, ConfiguracionBot, CONFIGURACION_BOT_ID, Categoria } from "../config/db.js";
 
 //Dirección del local, mostrada automáticamente a quien elige "retiro". Si no está
 //configurada, se avisa igual sin romper el flujo.
 const DIRECCION_LOCAL = process.env.DIRECCION_LOCAL || "contáctanos para coordinar el retiro (dirección aún no configurada)";
+
+function mensajeMetodoPago(modalidad: "delivery" | "retiro"): string {
+  const notaEnvio =
+    modalidad === "delivery"
+      ? "\n\n📦 Recuerda: el envío se paga solo por transferencia bancaria (la comida la puedes pagar en efectivo)."
+      : "";
+  return `💳 ¿Cómo vas a pagar?\n\n1️⃣ Efectivo\n2️⃣ Transferencia${notaEnvio}`;
+}
+
+//Horario real del negocio (ver ADR-002 / HorarioAtencion). Se usa como mensaje de
+//respaldo cuando no queda ningún turno disponible hoy para agendar.
+const MENSAJE_CERRADO_SIN_AGENDA =
+  "🕒 Ahora estamos cerrados y no quedan horarios disponibles para agendar hoy.\n\n" +
+  "Nuestro horario:\n📅 Martes a sábado: 12:00-16:30 y 19:00-22:00\n📅 Domingo: 12:00-17:00\n📅 Lunes: cerrado\n\n" +
+  "¡Te esperamos pronto! 👋";
 
 //Imagen con los datos bancarios (cuenta RUT + logo Mercado Pago) que se manda al
 //elegir "transferencia", para que el cliente no tenga que leer un mensaje de texto.
@@ -57,9 +85,18 @@ if (existsSync(RUTA_DATOS_BANCARIOS)) {
 //Pausa de emergencia del bot, controlada desde el dashboard (ver src/routes/configuracion.ts).
 //Cacheada en memoria para no consultar la DB en cada mensaje entrante; se refresca
 //con actualizarConfiguracionBotCache() cuando el equipo cambia el toggle.
-let configuracionBot: { activo: boolean; mensajePausa: string } = {
+interface ConfiguracionBotCache {
+  activo: boolean;
+  mensajePausa: string;
+  duracionFranjaMin: number;
+  capacidadPorFranja: number;
+}
+
+let configuracionBot: ConfiguracionBotCache = {
   activo: true,
   mensajePausa: "En este momento no estamos tomando pedidos por este medio. Por favor intenta más tarde o comunícate directamente con el local.",
+  duracionFranjaMin: 15,
+  capacidadPorFranja: 1,
 };
 
 export async function cargarConfiguracionBot(): Promise<void> {
@@ -68,35 +105,79 @@ export async function cargarConfiguracionBot(): Promise<void> {
       where: { id: CONFIGURACION_BOT_ID },
       defaults: { id: CONFIGURACION_BOT_ID },
     });
-    configuracionBot = { activo: fila.activo, mensajePausa: fila.mensajePausa };
+    configuracionBot = {
+      activo: fila.activo,
+      mensajePausa: fila.mensajePausa,
+      duracionFranjaMin: fila.duracionFranjaMin,
+      capacidadPorFranja: fila.capacidadPorFranja,
+    };
   } catch (e) {
     console.warn("No se pudo cargar la configuración del bot, se usa el valor por defecto (activo):", e);
   }
 }
 
-export function actualizarConfiguracionBotCache(cambios: { activo?: boolean; mensajePausa?: string }): void {
+export function actualizarConfiguracionBotCache(cambios: Partial<ConfiguracionBotCache>): void {
   configuracionBot = { ...configuracionBot, ...cambios };
 }
-
-//Catálogo único: fuente de verdad para el menú mostrado y para la validación de pedidos.
-const catalogo: Record<string, CarritoItem> = {
-  "11": { nombre: "Lomo Saltado", precio: 8990 },
-  "12": { nombre: "Ají de Gallina", precio: 7490 },
-  "13": { nombre: "Ceviche de Pescado", precio: 9990 },
-  "14": { nombre: "Papas a la Huancaína", precio: 4990 },
-};
 
 const emojiDigito: Record<string, string> = {
   "0": "0️⃣", "1": "1️⃣", "2": "2️⃣", "3": "3️⃣", "4": "4️⃣",
   "5": "5️⃣", "6": "6️⃣", "7": "7️⃣", "8": "8️⃣", "9": "9️⃣",
 };
 
-function generarMenuTexto(): string {
-  const lineas = Object.entries(catalogo).map(([codigo, item]) => {
-    const numeroEmoji = codigo.split("").map((d) => emojiDigito[d]).join("");
-    return `${numeroEmoji} ${item.nombre} - $${item.precio.toLocaleString("es-CL")}`;
-  });
-  return `*--- MENÚ URBANPERÚ 🇵🇪 ---*\n\n${lineas.join("\n")}\n\n👉 *Escribe el número del plato que deseas agregar a tu pedido (ej: 11).*`;
+function numeroEmoji(n: number): string {
+  return String(n).split("").map((d) => emojiDigito[d]).join("");
+}
+
+//Menú real: se agrupa en categorías (ver ELIGIENDO_CATEGORIA) en vez de un
+//listado plano, porque es muy extenso para leerlo de un tirón por WhatsApp.
+async function generarListaCategorias(): Promise<string> {
+  const categorias = await Categoria.findAll({ order: [["orden", "ASC"]] });
+  const lineas = categorias.map((c, i) => `${numeroEmoji(i + 1)} ${c.nombre}`);
+  return `*--- MENÚ URBANPERÚ 🇵🇪 ---*\n\n${lineas.join("\n")}\n${numeroEmoji(0)} Ver todo el menú\n\n👉 *Escribe el número de la categoría que te interesa.*`;
+}
+
+//categoriaId=null → "ver todo el menú" (agrupado por categoría, numeración
+//continua). Con categoriaId → solo esa categoría, numeración 1..N reiniciada.
+//Devuelve también el mapa código→producto para guardar en menuActualPendiente.
+async function generarMenuCategoria(
+  categoriaId: string | null
+): Promise<{ texto: string; codigos: Record<string, CarritoItem> }> {
+  const codigos: Record<string, CarritoItem> = {};
+  let contador = 0;
+
+  if (categoriaId) {
+    const categoria = await Categoria.findByPk(categoriaId);
+    const productos = await Producto.findAll({
+      where: { categoriaId, disponible: true },
+      order: [["orden", "ASC"]],
+    });
+    const lineas = productos.map((p) => {
+      contador++;
+      codigos[String(contador)] = { productoId: p.id, nombre: p.nombre, precio: p.precio };
+      return `${numeroEmoji(contador)} ${p.nombre} - $${p.precio.toLocaleString("es-CL")}`;
+    });
+    const texto = `*${categoria?.nombre ?? "Menú"}*\n\n${lineas.join("\n")}\n\n👉 *Escribe el número del plato para agregarlo, o "listo" para ver las categorías de nuevo.*`;
+    return { texto, codigos };
+  }
+
+  const categorias = await Categoria.findAll({ order: [["orden", "ASC"]] });
+  const bloques: string[] = [];
+  for (const categoria of categorias) {
+    const productos = await Producto.findAll({
+      where: { categoriaId: categoria.id, disponible: true },
+      order: [["orden", "ASC"]],
+    });
+    if (productos.length === 0) continue;
+    const lineas = productos.map((p) => {
+      contador++;
+      codigos[String(contador)] = { productoId: p.id, nombre: p.nombre, precio: p.precio };
+      return `${numeroEmoji(contador)} ${p.nombre} - $${p.precio.toLocaleString("es-CL")}`;
+    });
+    bloques.push(`*${categoria.nombre}*\n${lineas.join("\n")}`);
+  }
+  const texto = `*--- MENÚ COMPLETO ---*\n\n${bloques.join("\n\n")}\n\n👉 *Escribe el número del plato para agregarlo, o "listo" para ver las categorías de nuevo.*`;
+  return { texto, codigos };
 }
 
 //Arma el listado de items + total (usado tanto en la vista previa antes de
@@ -109,6 +190,7 @@ function formatResumenCarrito(
     modalidad?: "delivery" | "retiro";
     direccion?: string;
     montoRecibido?: number;
+    horaProgramadaTexto?: string;
   } = {}
 ): { texto: string; total: number } {
   let total = 0;
@@ -123,6 +205,9 @@ function formatResumenCarrito(
   }
   if (opts.direccion) {
     texto += `\n📍 Dirección: ${opts.direccion}`;
+  }
+  if (opts.horaProgramadaTexto) {
+    texto += `\n🗓️ Agendado para las ${opts.horaProgramadaTexto}`;
   }
   if (opts.metodoPago) {
     texto += `\n💳 Pago: ${opts.metodoPago === "efectivo" ? "Efectivo" : "Transferencia"}`;
@@ -215,24 +300,91 @@ async function manejarMensaje(
       console.log(`Cliente frecuente Telefono: ${numeroTelefono}`);
     }
 
+    // 2a. ¿ESTAMOS ESPERANDO CONFIRMAR SI QUIERE AGENDAR FUERA DE HORARIO? (ADR-002)
+    if (estadosUsuarios[numeroTelefono] === "ESPERANDO_CONFIRMAR_AGENDA") {
+      const respuesta = textoCliente.toLowerCase();
+      if (respuesta === "si" || respuesta === "sí") {
+        pedidosProgramadosPendientes[numeroTelefono] = true;
+        estadosUsuarios[numeroTelefono] = "ELIGIENDO_CATEGORIA";
+        await responder(await generarListaCategorias());
+        return;
+      }
+      if (respuesta === "no") {
+        delete estadosUsuarios[numeroTelefono];
+        await responder("Sin problema, te esperamos en nuestro horario de atención. ¡Hasta pronto! 👋");
+        return;
+      }
+      await responder("Por favor responde *SI* o *NO*.");
+      return;
+    }
+
     // 2b. ¿ESTAMOS ESPERANDO LA MODALIDAD DE ENTREGA?
     // Va justo después de "pagar" y antes del método de pago (ver ADR en el handoff).
     if (estadosUsuarios[numeroTelefono] === "PIDIENDO_MODALIDAD") {
-      if (textoCliente === "1") {
-        modalidadesPendientes[numeroTelefono] = "delivery";
+      if (textoCliente === "1" || textoCliente === "2") {
+        const modalidad: "delivery" | "retiro" = textoCliente === "1" ? "delivery" : "retiro";
+        modalidadesPendientes[numeroTelefono] = modalidad;
+        const prefijo = modalidad === "retiro" ? `📍 Retiras en nuestro local: ${DIRECCION_LOCAL}\n\n` : "";
+
+        // Pedido agendado (ver ADR-002): en vez de ir directo al método de pago,
+        // pregunta la hora dentro de los turnos que quedan hoy.
+        if (pedidosProgramadosPendientes[numeroTelefono]) {
+          const franjas = await calcularFranjasDisponibles(configuracionBot.duracionFranjaMin, configuracionBot.capacidadPorFranja);
+          if (franjas.length === 0) {
+            // Se llenaron los horarios mientras elegía la modalidad (raro, pero posible).
+            delete pedidosProgramadosPendientes[numeroTelefono];
+            estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
+            await responder(`${prefijo}Se acaban de llenar los horarios disponibles para agendar hoy.\n\n${mensajeMetodoPago(modalidad)}`);
+            return;
+          }
+          franjasPendientes[numeroTelefono] = franjas;
+          estadosUsuarios[numeroTelefono] = "ELIGIENDO_HORA_PROGRAMADA";
+          const lista = franjas.map((f, i) => `${numeroEmoji(i + 1)} ${f.inicio}-${f.fin}`).join("\n");
+          await responder(`${prefijo}🗓️ ¿Para qué hora lo necesitas?\n\n${lista}`);
+          return;
+        }
+
         estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
-        await responder(
-          "💳 ¿Cómo vas a pagar?\n\n1️⃣ Efectivo\n2️⃣ Transferencia\n\n📦 Recuerda: el envío se paga solo por transferencia bancaria (la comida la puedes pagar en efectivo)."
-        );
-        return;
-      }
-      if (textoCliente === "2") {
-        modalidadesPendientes[numeroTelefono] = "retiro";
-        estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
-        await responder(`📍 Retiras en nuestro local: ${DIRECCION_LOCAL}\n\n💳 ¿Cómo vas a pagar?\n\n1️⃣ Efectivo\n2️⃣ Transferencia`);
+        await responder(`${prefijo}${mensajeMetodoPago(modalidad)}`);
         return;
       }
       await responder("Por favor responde *1* para Delivery o *2* para Retiro en el local.");
+      return;
+    }
+
+    // 2c. ¿ESTAMOS ELIGIENDO LA HORA DE UN PEDIDO AGENDADO? (ver ADR-002)
+    if (estadosUsuarios[numeroTelefono] === "ELIGIENDO_HORA_PROGRAMADA") {
+      const franjas = franjasPendientes[numeroTelefono] ?? [];
+      const elegida = franjas[Number(textoCliente) - 1];
+      if (!elegida) {
+        await responder("Por favor elige un número válido de la lista de horarios.");
+        return;
+      }
+      horaProgramadaPendientes[numeroTelefono] = horaChileAFecha(elegida.inicio);
+      estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
+      await responder(mensajeMetodoPago(modalidadesPendientes[numeroTelefono]));
+      return;
+    }
+
+    // 2d. ¿ESTAMOS ELIGIENDO CATEGORÍA DEL MENÚ?
+    if (estadosUsuarios[numeroTelefono] === "ELIGIENDO_CATEGORIA") {
+      if (textoCliente === "0") {
+        const { texto, codigos } = await generarMenuCategoria(null);
+        menuActualPendiente[numeroTelefono] = codigos;
+        estadosUsuarios[numeroTelefono] = "REALIZANDO_PEDIDO";
+        await responder(texto);
+        return;
+      }
+      const categorias = await Categoria.findAll({ order: [["orden", "ASC"]] });
+      const categoria = categorias[Number(textoCliente) - 1];
+      if (!categoria) {
+        await responder('Por favor elige un número válido de categoría, o *0* para ver todo el menú.');
+        return;
+      }
+      const { texto, codigos } = await generarMenuCategoria(categoria.id);
+      menuActualPendiente[numeroTelefono] = codigos;
+      estadosUsuarios[numeroTelefono] = "REALIZANDO_PEDIDO";
+      await responder(texto);
       return;
     }
 
@@ -294,11 +446,13 @@ async function manejarMensaje(
       estadosUsuarios[numeroTelefono] = "CONFIRMANDO_PEDIDO";
 
       const miCarrito = carritos[numeroTelefono] ?? [];
+      const horaProgramadaPreview = horaProgramadaPendientes[numeroTelefono];
       const { texto } = formatResumenCarrito(miCarrito, nota, {
         metodoPago: metodosPagoPendientes[numeroTelefono],
         modalidad: modalidadesPendientes[numeroTelefono],
         direccion: direccionesPendientes[numeroTelefono],
         montoRecibido: montosRecibidosPendientes[numeroTelefono],
+        horaProgramadaTexto: horaProgramadaPreview ? formatHoraChile(horaProgramadaPreview) : undefined,
       });
       await responder(`*🧾 REVISA TU PEDIDO ANTES DE ENVIARLO:*\n\n${texto}\n\n¿Confirmas? Responde *SI* para mandarlo a cocina o *NO* para seguir editando.`);
       return;
@@ -317,6 +471,9 @@ async function manejarMensaje(
         delete modalidadesPendientes[numeroTelefono];
         delete direccionesPendientes[numeroTelefono];
         delete montosRecibidosPendientes[numeroTelefono];
+        delete pedidosProgramadosPendientes[numeroTelefono];
+        delete franjasPendientes[numeroTelefono];
+        delete horaProgramadaPendientes[numeroTelefono];
         await responder("Sin problema, sigue agregando platos o escribe *pagar* cuando estés listo.");
         return;
       }
@@ -339,14 +496,21 @@ async function manejarMensaje(
       const modalidad = modalidadesPendientes[numeroTelefono] ?? null;
       const direccion = direccionesPendientes[numeroTelefono] ?? null;
       const montoRecibido = montosRecibidosPendientes[numeroTelefono] ?? null;
+      const horaProgramada = horaProgramadaPendientes[numeroTelefono] ?? null;
       const { texto: resumenItems, total } = formatResumenCarrito(miCarrito, nota, {
         metodoPago,
         modalidad: modalidad ?? undefined,
         direccion: direccion ?? undefined,
         montoRecibido: montoRecibido ?? undefined,
+        horaProgramadaTexto: horaProgramada ? formatHoraChile(horaProgramada) : undefined,
       });
-      const tiempoEstimado = await calcularTiempoEstimado();
-      const resumen = `*🧾 RESUMEN DE TU PEDIDO:*\n\n${resumenItems}\n⏱️ Tiempo estimado: ${tiempoEstimado.min}-${tiempoEstimado.max} min\n\n¡Tu pedido ha sido confirmado! 🧑‍🍳 En breve te contactaremos para coordinar el pago y la entrega.`;
+      // Un pedido agendado ya tiene una hora comprometida — no tiene sentido
+      // mostrarle además un rango de espera "en vivo" (ver ADR-002).
+      const tiempoEstimado = horaProgramada ? null : await calcularTiempoEstimado();
+      const lineaTiempo = horaProgramada
+        ? `🗓️ Tu pedido quedó agendado para las ${formatHoraChile(horaProgramada)}.`
+        : `⏱️ Tiempo estimado: ${tiempoEstimado!.min}-${tiempoEstimado!.max} min`;
+      const resumen = `*🧾 RESUMEN DE TU PEDIDO:*\n\n${resumenItems}\n${lineaTiempo}\n\n¡Tu pedido ha sido confirmado! 🧑‍🍳 En breve te contactaremos para coordinar el pago y la entrega.`;
 
       // ============ PERSISTENCIA EN BD ============
       // Guarda el pedido y sus detalles para que sobreviva a un reinicio del bot
@@ -370,19 +534,18 @@ async function manejarMensaje(
           modalidad,
           direccion,
           montoRecibido,
-          tiempoEstimadoMin: tiempoEstimado.min,
-          tiempoEstimadoMax: tiempoEstimado.max,
+          tiempoEstimadoMin: tiempoEstimado?.min ?? null,
+          tiempoEstimadoMax: tiempoEstimado?.max ?? null,
+          horaProgramada,
         });
         pedidoId = nuevoPedido.id;
 
+        // Los items ya vienen con productoId real (elegidos del menú por categorías,
+        // ver ELIGIENDO_CATEGORIA) — ya no hace falta buscar/crear por nombre.
         for (const item of miCarrito) {
-          const [productoDb] = await Producto.findOrCreate({
-            where: { nombre: item.nombre },
-            defaults: { nombre: item.nombre, precio: item.precio },
-          });
           await DetallePedido.create({
             pedido_id: nuevoPedido.id,
-            producto_id: productoDb.id,
+            producto_id: item.productoId,
             cantidad: 1,
             precio_unitario: item.precio,
           });
@@ -415,14 +578,19 @@ async function manejarMensaje(
           modalidad,
           direccion,
           montoRecibido,
-          tiempoEstimadoMin: tiempoEstimado.min,
-          tiempoEstimadoMax: tiempoEstimado.max,
+          tiempoEstimadoMin: tiempoEstimado?.min ?? null,
+          tiempoEstimadoMax: tiempoEstimado?.max ?? null,
+          horaProgramada: horaProgramada ? horaProgramada.toISOString() : null,
           fecha: new Date().toISOString(),
         };
 
-        io.emit("nuevo_pedido", pedidoPayload);
+        // Un pedido agendado no debe aparecer en el feed de "activos ahora" del
+        // dashboard (la cocina no debe empezarlo antes de tiempo) — va a su propia
+        // sección, alimentada por este evento distinto (ver GET /api/pedidos/programados).
+        const evento = horaProgramada ? "nuevo_pedido_programado" : "nuevo_pedido";
+        io.emit(evento, pedidoPayload);
 
-        console.log(`[Socket.IO] Evento 'nuevo_pedido' emitido para ${numeroTelefono} total $${total.toLocaleString("es-CL")}`);
+        console.log(`[Socket.IO] Evento '${evento}' emitido para ${numeroTelefono} total $${total.toLocaleString("es-CL")}`);
       } catch (socketErr) {
         // No romper el flujo del pedido si Socket.IO aún no está listo
         // En producción podrías persistir en DB y hacer polling fallback
@@ -440,6 +608,10 @@ async function manejarMensaje(
       delete modalidadesPendientes[numeroTelefono];
       delete direccionesPendientes[numeroTelefono];
       delete montosRecibidosPendientes[numeroTelefono];
+      delete pedidosProgramadosPendientes[numeroTelefono];
+      delete franjasPendientes[numeroTelefono];
+      delete horaProgramadaPendientes[numeroTelefono];
+      delete menuActualPendiente[numeroTelefono];
 
       await responder(resumen);
       return;
@@ -459,8 +631,19 @@ async function manejarMensaje(
     // 4. ENRUTADOR PRINCIPAL (OPCIÓN 1 y 2)
     // Solo respondemos al 1 y 2 si NO están dentro de un pedido
     if (textoCliente === "1" && estadosUsuarios[numeroTelefono] !== "REALIZANDO_PEDIDO") {
-      estadosUsuarios[numeroTelefono] = "REALIZANDO_PEDIDO";
-      await responder(generarMenuTexto());
+      // Fuera de horario (ADR-002): ofrece agendar en vez de mostrar el menú directo.
+      if (!(await estaAbierto())) {
+        const franjas = await calcularFranjasDisponibles(configuracionBot.duracionFranjaMin, configuracionBot.capacidadPorFranja);
+        if (franjas.length === 0) {
+          await responder(MENSAJE_CERRADO_SIN_AGENDA);
+          return;
+        }
+        estadosUsuarios[numeroTelefono] = "ESPERANDO_CONFIRMAR_AGENDA";
+        await responder(`🕒 Ahora estamos cerrados. Volvemos a abrir hoy a las ${franjas[0].inicio}. ¿Quieres agendar tu pedido para más tarde? Responde *SI* o *NO*.`);
+        return;
+      }
+      estadosUsuarios[numeroTelefono] = "ELIGIENDO_CATEGORIA";
+      await responder(await generarListaCategorias());
       return;
     }
 
@@ -499,17 +682,25 @@ async function manejarMensaje(
         return;
       }
 
-      // b) Si el cliente ingresa un plato
-      const productoElegido = catalogo[textoCliente];
+      // b) Si el cliente quiere ver las categorías de nuevo (para seguir agregando
+      // platos de otra categoría al mismo pedido, ver ELIGIENDO_CATEGORIA).
+      if (textoCliente.toLowerCase() === "listo") {
+        estadosUsuarios[numeroTelefono] = "ELIGIENDO_CATEGORIA";
+        await responder(await generarListaCategorias());
+        return;
+      }
+
+      // c) Si el cliente ingresa un plato (código del último listado mostrado)
+      const productoElegido = menuActualPendiente[numeroTelefono]?.[textoCliente];
 
       if (productoElegido) {
         if (!carritos[numeroTelefono]) {
           carritos[numeroTelefono] = [];
         }
         carritos[numeroTelefono].push(productoElegido);
-        await responder(`✅ *${productoElegido.nombre}* agregado a tu pedido.\n\n👉 Escribe otro código si quieres pedir algo más, o escribe *pagar* para enviar tu pedido a la cocina.`);
+        await responder(`✅ *${productoElegido.nombre}* agregado a tu pedido.\n\n👉 Escribe otro código para seguir en esta categoría, *listo* para ver las categorías de nuevo, o *pagar* para enviar tu pedido a la cocina.`);
       } else {
-        await responder("❌ Código no reconocido. Por favor, escribe un número válido del menú (ej: 11) o escribe *pagar* para terminar.");
+        await responder('❌ Código no reconocido. Escribe un número válido del listado, *listo* para ver las categorías, o *pagar* para terminar.');
       }
     }
   } catch (error) {
