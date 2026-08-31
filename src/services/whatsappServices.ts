@@ -49,12 +49,53 @@ const modalidadesPendientes: Record<string, "delivery" | "retiro"> = {};
 const direccionesPendientes: Record<string, string> = {};
 const montosRecibidosPendientes: Record<string, number> = {};
 
+//Simulación manual del horario (ADR-002) para pruebas, sin tocar HorarioAtencion
+//ni afectar a ningún cliente real. No existe fuera de NODE_ENV !== "production",
+//y solo responde a los números en NUMEROS_PRUEBA. "cerrado" fuerza el flujo de
+//local cerrado aunque el horario real diga abierto; "abierto" fuerza lo
+//contrario (útil para probar el flujo normal en un día/hora realmente cerrado).
+const NUMEROS_PRUEBA =
+  process.env.NODE_ENV !== "production"
+    ? (process.env.NUMEROS_PRUEBA || "").split(",").map((n) => n.trim()).filter(Boolean)
+    : [];
+const simulacionHorarioPorNumero = new Map<string, "cerrado" | "abierto">();
+
+function simulacionHorario(numeroTelefono: string): "cerrado" | "abierto" | null {
+  if (process.env.NODE_ENV === "production") return null;
+  return simulacionHorarioPorNumero.get(numeroTelefono) ?? null;
+}
+
 //Import de las tablas
 import { Cliente, Pedido, Producto, DetallePedido, ConfiguracionBot, CONFIGURACION_BOT_ID, Categoria } from "../config/db.js";
 
 //Dirección del local, mostrada automáticamente a quien elige "retiro". Si no está
 //configurada, se avisa igual sin romper el flujo.
 const DIRECCION_LOCAL = process.env.DIRECCION_LOCAL || "contáctanos para coordinar el retiro (dirección aún no configurada)";
+
+//Reconocimiento flexible de saludos y preguntas de "¿están abiertos?", tolerante
+//a tildes, mayúsculas y errores ortográficos comunes (ola, asta, etc.).
+function normalizarTexto(texto: string): string {
+  return texto
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/[¿?¡!.,]/g, "")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+const PATRON_SALUDO =
+  /^(h*o+l+a+|hey+|holis|buen[oa]s?(\s+(dias?|tardes?|noches?))?|que\s*tal|buenas)$/;
+
+function esSaludo(textoCliente: string): boolean {
+  return PATRON_SALUDO.test(normalizarTexto(textoCliente));
+}
+
+const PATRON_CONSULTA_ESTADO = /\b(abiert|cerrad|atend|disponib|abren)\w*\b/;
+
+function esConsultaEstado(textoCliente: string): boolean {
+  return PATRON_CONSULTA_ESTADO.test(normalizarTexto(textoCliente));
+}
 
 function mensajeMetodoPago(modalidad: "delivery" | "retiro"): string {
   const notaEnvio =
@@ -90,6 +131,10 @@ interface ConfiguracionBotCache {
   mensajePausa: string;
   duracionFranjaMin: number;
   capacidadPorFranja: number;
+  //Aviso adicional por WhatsApp cuando llega un pedido nuevo (ver notificarStaff
+  //más abajo) — parche para cuando el sonido del dashboard no es confiable.
+  notificacionesWhatsappActivas: boolean;
+  numeroNotificaciones: string | null;
 }
 
 let configuracionBot: ConfiguracionBotCache = {
@@ -97,6 +142,8 @@ let configuracionBot: ConfiguracionBotCache = {
   mensajePausa: "En este momento no estamos tomando pedidos por este medio. Por favor intenta más tarde o comunícate directamente con el local.",
   duracionFranjaMin: 15,
   capacidadPorFranja: 1,
+  notificacionesWhatsappActivas: false,
+  numeroNotificaciones: null,
 };
 
 export async function cargarConfiguracionBot(): Promise<void> {
@@ -110,6 +157,8 @@ export async function cargarConfiguracionBot(): Promise<void> {
       mensajePausa: fila.mensajePausa,
       duracionFranjaMin: fila.duracionFranjaMin,
       capacidadPorFranja: fila.capacidadPorFranja,
+      notificacionesWhatsappActivas: fila.notificacionesWhatsappActivas,
+      numeroNotificaciones: fila.numeroNotificaciones,
     };
   } catch (e) {
     console.warn("No se pudo cargar la configuración del bot, se usa el valor por defecto (activo):", e);
@@ -180,6 +229,30 @@ async function generarMenuCategoria(
   return { texto, codigos };
 }
 
+//Compartido entre la opción "1" del menú y las preguntas de "¿están abiertos?"
+//(ver esConsultaEstado): si está cerrado (real o simulado, ver ADR-002) ofrece
+//agendar; si está abierto, muestra las categorías directamente.
+async function mostrarMenuOAgendar(
+  numeroTelefono: string,
+  responder: (texto: string) => Promise<unknown>,
+  prefijoSiAbierto = ""
+): Promise<void> {
+  const simulacion = simulacionHorario(numeroTelefono);
+  const abierto = simulacion === "abierto" ? true : simulacion === "cerrado" ? false : await estaAbierto();
+  if (!abierto) {
+    const franjas = await calcularFranjasDisponibles(configuracionBot.duracionFranjaMin, configuracionBot.capacidadPorFranja);
+    if (franjas.length === 0) {
+      await responder(MENSAJE_CERRADO_SIN_AGENDA);
+      return;
+    }
+    estadosUsuarios[numeroTelefono] = "ESPERANDO_CONFIRMAR_AGENDA";
+    await responder(`🕒 Ahora estamos cerrados. Volvemos a abrir hoy a las ${franjas[0].inicio}. ¿Quieres agendar tu pedido para más tarde? Responde *SI* o *NO*.`);
+    return;
+  }
+  estadosUsuarios[numeroTelefono] = "ELIGIENDO_CATEGORIA";
+  await responder(`${prefijoSiAbierto}${await generarListaCategorias()}`);
+}
+
 //Arma el listado de items + total (usado tanto en la vista previa antes de
 //confirmar como en el recibo final, para no duplicar el cálculo).
 function formatResumenCarrito(
@@ -243,13 +316,36 @@ async function manejarMensaje(
   numeroTelefono: string,
   textoCliente: string,
   responder: (texto: string) => Promise<unknown>,
-  enviarDatosBancarios: () => Promise<void>
+  enviarDatosBancarios: () => Promise<void>,
+  notificarStaff: (texto: string) => Promise<unknown>
 ): Promise<void> {
   if (textoCliente.toLowerCase() === "reset") {
     await Cliente.destroy({ where: { telefono: numeroTelefono } });
     delete estadosUsuarios[numeroTelefono];
     await responder("Tu usuario a sido eliminado.");
     return;
+  }
+
+  //Comando de prueba manual: fuerza "cerrado" o "abierto" (ADR-002) sin depender
+  //del horario real. Solo existe fuera de producción, y solo para los números
+  //listados en NUMEROS_PRUEBA — invisible para cualquier otro cliente.
+  if (process.env.NODE_ENV !== "production" && NUMEROS_PRUEBA.includes(numeroTelefono)) {
+    const comando = textoCliente.toLowerCase().trim();
+    if (comando === "/simular cerrado") {
+      simulacionHorarioPorNumero.set(numeroTelefono, "cerrado");
+      await responder("🧪 Modo prueba: este número ahora ve el local como *cerrado*, sin importar el horario real. Escribe */simular abierto* o */simular normal* para cambiarlo.");
+      return;
+    }
+    if (comando === "/simular abierto") {
+      simulacionHorarioPorNumero.set(numeroTelefono, "abierto");
+      await responder("🧪 Modo prueba: este número ahora ve el local como *abierto*, sin importar el horario real. Escribe */simular cerrado* o */simular normal* para cambiarlo.");
+      return;
+    }
+    if (comando === "/simular normal") {
+      simulacionHorarioPorNumero.delete(numeroTelefono);
+      await responder("🧪 Modo prueba: este número vuelve a ver el horario real.");
+      return;
+    }
   }
 
   //Cliente atendido por una persona: el bot se queda callado para no interrumpir
@@ -261,9 +357,17 @@ async function manejarMensaje(
 
   //Si llegó texto en vez de una imagen mientras se esperaba el comprobante (la
   //imagen en sí se maneja antes de esta función, en messages.upsert, porque
-  //necesita el socket para descargarla).
+  //necesita el socket para descargarla). También permite corregir el método de
+  //pago si el cliente eligió "transferencia" por error.
   if (estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE") {
-    await responder("Por favor envía la *imagen* del comprobante de transferencia (foto o captura de pantalla).");
+    const comando = textoCliente.toLowerCase().trim();
+    if (comando === "cambiar" || comando === "efectivo" || comando === "cambiar metodo" || comando === "cambiar método") {
+      delete metodosPagoPendientes[numeroTelefono];
+      estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
+      await responder(mensajeMetodoPago(modalidadesPendientes[numeroTelefono]));
+      return;
+    }
+    await responder('Por favor envía la *imagen* del comprobante de transferencia (foto o captura de pantalla). Si te equivocaste y quieres pagar en *efectivo*, escribe *cambiar*.');
     return;
   }
 
@@ -393,7 +497,8 @@ async function manejarMensaje(
       if (textoCliente === "1") {
         metodosPagoPendientes[numeroTelefono] = "efectivo";
         estadosUsuarios[numeroTelefono] = "PIDIENDO_MONTO_EFECTIVO";
-        await responder("💵 ¿Con qué billete vas a pagar, para llevarte el vuelto justo? (escribe solo el monto, ej: 10000)");
+        const { total } = formatResumenCarrito(carritos[numeroTelefono] ?? [], "");
+        await responder(`💵 Tu pedido suma *$${total.toLocaleString("es-CL")}*. ¿Con qué billete vas a pagar, para llevarte el vuelto justo? (escribe solo el monto, ej: 10000)`);
         return;
       }
       if (textoCliente === "2") {
@@ -409,9 +514,16 @@ async function manejarMensaje(
 
     // 3a-bis. ¿ESTAMOS ESPERANDO EL MONTO CON QUE PAGA EN EFECTIVO?
     if (estadosUsuarios[numeroTelefono] === "PIDIENDO_MONTO_EFECTIVO") {
+      const comandoCambiar = textoCliente.toLowerCase().trim();
+      if (comandoCambiar === "cambiar" || comandoCambiar === "transferencia" || comandoCambiar === "cambiar metodo" || comandoCambiar === "cambiar método") {
+        delete metodosPagoPendientes[numeroTelefono];
+        estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
+        await responder(mensajeMetodoPago(modalidadesPendientes[numeroTelefono]));
+        return;
+      }
       const monto = Number(textoCliente.replace(/[^\d]/g, ""));
       if (!monto) {
-        await responder("Por favor escribe solo el monto en números, ej: 10000.");
+        await responder("Por favor escribe solo el monto en números, ej: 10000. Si te equivocaste y quieres pagar por *transferencia*, escribe *cambiar*.");
         return;
       }
       const { total } = formatResumenCarrito(carritos[numeroTelefono] ?? [], "");
@@ -603,6 +715,22 @@ async function manejarMensaje(
       }
       // ===============================================================
 
+      // ============ AVISO ADICIONAL POR WHATSAPP (opcional) ============
+      // Parche para cuando el sonido del dashboard no es confiable (celular
+      // bloqueado): un WhatsApp corto al número de turno, además del evento de
+      // socket de arriba — no lo reemplaza, solo funciona como alarma.
+      if (configuracionBot.notificacionesWhatsappActivas && configuracionBot.numeroNotificaciones) {
+        const avisoModalidad = horaProgramada
+          ? `🗓️ agendado ${formatHoraChile(horaProgramada)}`
+          : modalidad === "retiro"
+            ? "🏪 retiro en local"
+            : "🛵 delivery";
+        await notificarStaff(
+          `🔔 *Pedido nuevo* — ${cliente.nombre}\n${miCarrito.length} plato(s) · $${total.toLocaleString("es-CL")} · ${avisoModalidad}\n\nRevisa el dashboard para los detalles.`
+        );
+      }
+      // ===============================================================
+
       // Limpieza de memoria
       delete estadosUsuarios[numeroTelefono];
       delete carritos[numeroTelefono];
@@ -621,8 +749,15 @@ async function manejarMensaje(
       return;
     }
 
-    // 3. LÓGICA DEL SALUDO
-    if (textoCliente.toLowerCase() === "hola") {
+    // 3. LÓGICA DEL SALUDO (tolerante a variantes/typos: ola, buenas, buenos días...)
+    // y de preguntas de "¿están abiertos/atendiendo/disponibles?". Ninguna de las
+    // dos debe interrumpir un pedido ya en curso.
+    if (estadosUsuarios[numeroTelefono] !== "REALIZANDO_PEDIDO" && esConsultaEstado(textoCliente)) {
+      await mostrarMenuOAgendar(numeroTelefono, responder, "✅ ¡Sí, estamos atendiendo! 🇵🇪\n\n");
+      return;
+    }
+
+    if (estadosUsuarios[numeroTelefono] !== "REALIZANDO_PEDIDO" && esSaludo(textoCliente)) {
       if (fueCreado || !cliente.nombre || cliente.nombre.trim() === "Por definir") {
         estadosUsuarios[numeroTelefono] = "ESPERANDO_NOMBRE";
         await responder("¡Hola! Soy el asistente virtual de UrbanPerú 🇵🇪. Veo que es tu primera vez pidiendo con nosotros. ¿Me podrías decir tu nombre para registrarte?");
@@ -635,19 +770,7 @@ async function manejarMensaje(
     // 4. ENRUTADOR PRINCIPAL (OPCIÓN 1 y 2)
     // Solo respondemos al 1 y 2 si NO están dentro de un pedido
     if (textoCliente === "1" && estadosUsuarios[numeroTelefono] !== "REALIZANDO_PEDIDO") {
-      // Fuera de horario (ADR-002): ofrece agendar en vez de mostrar el menú directo.
-      if (!(await estaAbierto())) {
-        const franjas = await calcularFranjasDisponibles(configuracionBot.duracionFranjaMin, configuracionBot.capacidadPorFranja);
-        if (franjas.length === 0) {
-          await responder(MENSAJE_CERRADO_SIN_AGENDA);
-          return;
-        }
-        estadosUsuarios[numeroTelefono] = "ESPERANDO_CONFIRMAR_AGENDA";
-        await responder(`🕒 Ahora estamos cerrados. Volvemos a abrir hoy a las ${franjas[0].inicio}. ¿Quieres agendar tu pedido para más tarde? Responde *SI* o *NO*.`);
-        return;
-      }
-      estadosUsuarios[numeroTelefono] = "ELIGIENDO_CATEGORIA";
-      await responder(await generarListaCategorias());
+      await mostrarMenuOAgendar(numeroTelefono, responder);
       return;
     }
 
@@ -691,8 +814,8 @@ async function manejarMensaje(
         const { total: totalActual } = formatResumenCarrito(miCarrito, "");
         const pagoResuelto =
           metodoPago === "transferencia" ? !!comprobantesPendientes[numeroTelefono] :
-          metodoPago === "efectivo" ? (montosRecibidosPendientes[numeroTelefono] ?? 0) >= totalActual :
-          false;
+            metodoPago === "efectivo" ? (montosRecibidosPendientes[numeroTelefono] ?? 0) >= totalActual :
+              false;
         // Si es un pedido agendado, la hora elegida también se borró al decir "no"
         // (ver ADR-002 — puede haber pasado tiempo y las franjas ya no ser las
         // mismas), así que si falta hay que volver a pedirla, no saltarla.
@@ -717,7 +840,41 @@ async function manejarMensaje(
         return;
       }
 
-      // c) Si el cliente ingresa un plato (código del último listado mostrado)
+      // c-bis) Ver el carrito o corregir un plato agregado por error (ver el mismo
+      // pedido del owner que dio origen al "cambiar" de método de pago).
+      if (textoCliente.toLowerCase() === "carrito") {
+        const miCarrito = carritos[numeroTelefono] ?? [];
+        if (miCarrito.length === 0) {
+          await responder("Tu carrito está vacío todavía. Escribe un código del menú para agregar un plato.");
+          return;
+        }
+        const lineas = miCarrito.map((item, i) => `${numeroEmoji(i + 1)} ${item.nombre} - $${item.precio.toLocaleString("es-CL")}`);
+        await responder(`🛒 *Tu pedido hasta ahora:*\n\n${lineas.join("\n")}\n\n👉 Escribe *quitar <número>* para eliminar un plato (ej: quitar 2), o sigue agregando códigos.`);
+        return;
+      }
+
+      const matchQuitar = textoCliente.toLowerCase().trim().match(/^quitar(?:\s+(\d+))?$/);
+      if (matchQuitar) {
+        const miCarrito = carritos[numeroTelefono] ?? [];
+        if (miCarrito.length === 0) {
+          await responder("Tu carrito ya está vacío, no hay nada que quitar.");
+          return;
+        }
+        // "quitar" sin número saca el último plato agregado (el caso típico de
+        // "me equivoqué de código"); "quitar N" saca uno específico de la lista
+        // mostrada con *carrito*.
+        const posicion = matchQuitar[1] ? Number(matchQuitar[1]) : miCarrito.length;
+        const indice = posicion - 1;
+        if (indice < 0 || indice >= miCarrito.length) {
+          await responder("No encontré ese número en tu carrito. Escribe *carrito* para ver la lista actualizada.");
+          return;
+        }
+        const [eliminado] = miCarrito.splice(indice, 1);
+        await responder(`🗑️ Quité *${eliminado.nombre}* de tu pedido.\n\n👉 Escribe *carrito* para ver lo que queda, otro código para seguir agregando, o *pagar* cuando estés listo.`);
+        return;
+      }
+
+      // d) Si el cliente ingresa un plato (código del último listado mostrado)
       const productoElegido = menuActualPendiente[numeroTelefono]?.[textoCliente];
 
       if (productoElegido) {
@@ -725,9 +882,9 @@ async function manejarMensaje(
           carritos[numeroTelefono] = [];
         }
         carritos[numeroTelefono].push(productoElegido);
-        await responder(`✅ *${productoElegido.nombre}* agregado a tu pedido.\n\n👉 Escribe otro código para seguir en esta categoría, *listo* para ver las categorías de nuevo, o *pagar* para enviar tu pedido a la cocina.`);
+        await responder(`✅ *${productoElegido.nombre}* agregado a tu pedido.\n\n👉 Escribe otro código para seguir en esta categoría. \n✅ *listo* para ver las categorías de nuevo\n 🛒*carrito* para revisar/quitar algo\n 💰*pagar* para enviar tu pedido a la cocina.`);
       } else {
-        await responder('❌ Código no reconocido. Escribe un número válido del listado, *listo* para ver las categorías, o *pagar* para terminar.');
+        await responder('❌ Código no reconocido. Escribe un número válido del listado, ✅*listo* para ver las categorías, 🛒*carrito* para revisar/quitar algo.💰*pagar* para enviar tu pedido a la cocina.');
       }
     }
   } catch (error) {
@@ -785,7 +942,7 @@ let socketRef: ReturnType<typeof makeWASocket> | null = null;
 export async function reiniciarWhatsapp(): Promise<void> {
   const anterior = socketRef;
   if (!anterior) {
-    await rm(".baileys_auth", { recursive: true, force: true }).catch(() => {});
+    await rm(".baileys_auth", { recursive: true, force: true }).catch(() => { });
     socketActivo = false;
     await iniciarWhatsapp();
     return;
@@ -798,7 +955,7 @@ export async function reiniciarWhatsapp(): Promise<void> {
     await anterior.logout();
   } catch (e) {
     console.warn("No se pudo cerrar sesión formalmente, se fuerza el reinicio igual:", e);
-    await rm(".baileys_auth", { recursive: true, force: true }).catch(() => {});
+    await rm(".baileys_auth", { recursive: true, force: true }).catch(() => { });
     socketActivo = false;
     socketRef = null;
     await iniciarWhatsapp();
@@ -909,6 +1066,18 @@ export async function iniciarWhatsapp(): Promise<void> {
         const numeroTelefono = fuenteTelefono.split("@")[0].split(":")[0];
         const responder = (t: string) => sock.sendMessage(jid, { text: t });
 
+        //Aviso adicional por WhatsApp al número de turno (ver ConfiguracionBot):
+        //parche opcional para cuando el sonido del dashboard no es confiable.
+        //No usa `responder` porque el destino es un número distinto al cliente.
+        const notificarStaff = async (texto: string) => {
+          if (!configuracionBot.numeroNotificaciones) return;
+          try {
+            await sock.sendMessage(`${configuracionBot.numeroNotificaciones}@s.whatsapp.net`, { text: texto });
+          } catch (e) {
+            console.warn("[WhatsApp] No se pudo enviar el aviso de pedido nuevo al staff:", e);
+          }
+        };
+
         //Pausa de emergencia (ver botón del dashboard / ConfiguracionBot): si está
         //pausado, no se procesa nada más, ni siquiera "reset" o un comprobante en curso.
         if (!configuracionBot.activo) {
@@ -959,7 +1128,7 @@ export async function iniciarWhatsapp(): Promise<void> {
         }
 
         const textoCliente = texto.trim();
-        await manejarMensaje(numeroTelefono, textoCliente, responder, enviarDatosBancarios);
+        await manejarMensaje(numeroTelefono, textoCliente, responder, enviarDatosBancarios, notificarStaff);
       })();
     }
   });

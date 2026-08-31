@@ -54,6 +54,10 @@ export function DashboardPage() {
     setDuracionFranjaMin,
     capacidadPorFranja,
     setCapacidadPorFranja,
+    notificacionesWhatsappActivas,
+    setNotificacionesWhatsappActivas,
+    numeroNotificaciones,
+    setNumeroNotificaciones,
   } = useBotEstado(token)
   const { pedidos: pedidosProgramados } = usePedidosProgramados(token)
   const [highlightId, setHighlightId] = useState<string | number | null>(null)
@@ -87,7 +91,11 @@ export function DashboardPage() {
     // "user activation" del tap y puede rechazar wakeLock.request() si llega
     // después de esperar el desbloqueo de audio (ver useWakeLock.ts).
     void requestWakeLock()
-    await unlock()
+    try {
+      await unlock()
+    } catch (e) {
+      console.warn('[Turno] unlock() falló de forma inesperada:', e)
+    }
     // Se inicia igual aunque falle el desbloqueo de audio (el banner de "Sonido
     // bloqueado" permite reintentarlo desde el dashboard).
     localStorage.setItem('shiftStarted', '1')
@@ -144,14 +152,20 @@ export function DashboardPage() {
     if (!token) return
     setGuardandoMensaje(true)
     try {
-      await actualizarConfiguracion(token, { mensajePausa, duracionFranjaMin, capacidadPorFranja })
+      await actualizarConfiguracion(token, {
+        mensajePausa,
+        duracionFranjaMin,
+        capacidadPorFranja,
+        notificacionesWhatsappActivas,
+        numeroNotificaciones: numeroNotificaciones.replace(/\D/g, '') || null,
+      })
       window.alert('Configuración guardada.')
     } catch (e) {
       window.alert(e instanceof Error ? e.message : 'No se pudo guardar la configuración')
     } finally {
       setGuardandoMensaje(false)
     }
-  }, [token, mensajePausa, duracionFranjaMin, capacidadPorFranja])
+  }, [token, mensajePausa, duracionFranjaMin, capacidadPorFranja, notificacionesWhatsappActivas, numeroNotificaciones])
 
   const botonReiniciar = (
     <button
@@ -278,7 +292,7 @@ export function DashboardPage() {
                 <p className="text-sm font-bold text-brand-200">Sonido bloqueado</p>
                 <p className="text-xs text-brand-200/70">Toca "Probar sonido" para re-activar notificaciones.</p>
               </div>
-              <button onClick={() => void playNotificationSound()} className="shrink-0 rounded-full bg-brand-500 px-3 py-1.5 text-xs font-black text-zinc-900">Probar</button>
+              <button onClick={() => void unlock()} className="shrink-0 rounded-full bg-brand-500 px-3 py-1.5 text-xs font-black text-zinc-900">Probar</button>
             </div>
           )}
           {wakeError && (
@@ -376,6 +390,31 @@ export function DashboardPage() {
                   />
                 </div>
               </div>
+            </div>
+            <div>
+              <p className="mb-2 text-[11px] font-bold tracking-widest text-zinc-500 uppercase">Aviso adicional por WhatsApp</p>
+              <p className="mb-2 text-xs text-zinc-500">
+                Si el sonido del dashboard no te avisa con el celular bloqueado, activa esto: el bot le manda un WhatsApp corto al número de turno por cada pedido nuevo. No reemplaza el dashboard, solo avisa.
+              </p>
+              <div className="flex items-center justify-between gap-3 mb-2">
+                <span className="text-sm font-medium text-zinc-300">Enviar aviso por WhatsApp</span>
+                <button
+                  type="button"
+                  onClick={() => setNotificacionesWhatsappActivas(!notificacionesWhatsappActivas)}
+                  className={`rounded-full px-4 py-1.5 text-xs font-black transition ${notificacionesWhatsappActivas ? 'bg-brand-500 text-zinc-900' : 'border border-zinc-700 bg-zinc-800 text-zinc-300'}`}
+                >
+                  {notificacionesWhatsappActivas ? 'Activado' : 'Desactivado'}
+                </button>
+              </div>
+              <label className="mb-1.5 block text-xs font-bold text-zinc-500">Número de turno (con código de país, sin +)</label>
+              <input
+                type="tel"
+                inputMode="numeric"
+                placeholder="56912345678"
+                value={numeroNotificaciones}
+                onChange={(e) => setNumeroNotificaciones(e.target.value.replace(/\D/g, ''))}
+                className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 focus:border-brand-400 focus:outline-none focus:ring-2 focus:ring-brand-400/20"
+              />
             </div>
             <button
               onClick={handleGuardarConfiguracion}

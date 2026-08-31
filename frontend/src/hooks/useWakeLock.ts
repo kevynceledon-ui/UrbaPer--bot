@@ -11,6 +11,15 @@ export function useWakeLock(enabled: boolean) {
   const [isLocked, setIsLocked] = useState(false)
   const [isFallback, setIsFallback] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Espejo de `isLocked` legible sin que el efecto de abajo dependa de él: si
+  // `isLocked` estuviera en las deps de ese efecto, cada `request()` exitoso lo
+  // haría re-ejecutarse (porque el propio efecto es quien cambia `isLocked`),
+  // lo que dispara un release()+request() en bucle — ese pausa/play constante
+  // es la causa real del error "play() interrupted by pause()".
+  const isLockedRef = useRef(false)
+  useEffect(() => {
+    isLockedRef.current = isLocked
+  }, [isLocked])
 
   // No depende de `enabled`: se llama tanto desde el efecto de abajo (mount /
   // volver de background) como directamente desde el gesto de click de "Iniciar
@@ -115,7 +124,7 @@ export function useWakeLock(enabled: boolean) {
 
     const handleVisibility = () => {
       if (document.visibilityState === 'visible' && enabled) {
-        if (!isLocked) void request()
+        if (!isLockedRef.current) void request()
       }
     }
 
@@ -127,7 +136,7 @@ export function useWakeLock(enabled: boolean) {
       window.removeEventListener('focus', handleVisibility)
       void release()
     }
-  }, [enabled, request, release, isLocked])
+  }, [enabled, request, release])
 
   return { isSupported: true, isLocked, isFallback, error, request, release }
 }

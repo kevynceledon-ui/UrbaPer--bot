@@ -23,6 +23,8 @@ router.get("/configuracion", authenticateToken, async (_req, res) => {
       mensajePausa: fila.mensajePausa,
       duracionFranjaMin: fila.duracionFranjaMin,
       capacidadPorFranja: fila.capacidadPorFranja,
+      notificacionesWhatsappActivas: fila.notificacionesWhatsappActivas,
+      numeroNotificaciones: fila.numeroNotificaciones,
     });
   } catch (error) {
     console.error("Error al leer la configuración del bot:", error);
@@ -37,6 +39,10 @@ const configuracionSchema = z.object({
   //que la dueña confirme cuántos pedidos puede tener listos en paralelo.
   duracionFranjaMin: z.number().int().positive().optional(),
   capacidadPorFranja: z.number().int().positive().optional(),
+  //Aviso adicional por WhatsApp al número de turno (parche para cuando el sonido
+  //del dashboard no es confiable con el celular bloqueado, ver whatsappServices.ts).
+  notificacionesWhatsappActivas: z.boolean().optional(),
+  numeroNotificaciones: z.string().trim().regex(/^\d*$/, "Solo dígitos, sin +, espacios ni guiones").optional().nullable(),
 });
 
 /**
@@ -51,13 +57,23 @@ router.patch("/configuracion", authenticateToken, async (req, res) => {
     return res.status(400).json({ ok: false, error: "Datos inválidos", details: parsed.error.flatten() });
   }
 
+  // Un campo de texto vacío en el dashboard significa "sin número configurado",
+  // no un string vacío literal — se guarda como null para que quede consistente
+  // con el resto del código (que trata "sin número" como null/falsy).
+  const datos = {
+    ...parsed.data,
+    ...(parsed.data.numeroNotificaciones !== undefined
+      ? { numeroNotificaciones: parsed.data.numeroNotificaciones || null }
+      : {}),
+  };
+
   try {
     const [fila] = await ConfiguracionBot.findOrCreate({
       where: { id: CONFIGURACION_BOT_ID },
       defaults: { id: CONFIGURACION_BOT_ID },
     });
-    await fila.update(parsed.data);
-    actualizarConfiguracionBotCache(parsed.data);
+    await fila.update(datos);
+    actualizarConfiguracionBotCache(datos);
 
     try {
       const { getIO } = await import("../config/socket.js");
@@ -72,6 +88,8 @@ router.patch("/configuracion", authenticateToken, async (req, res) => {
       mensajePausa: fila.mensajePausa,
       duracionFranjaMin: fila.duracionFranjaMin,
       capacidadPorFranja: fila.capacidadPorFranja,
+      notificacionesWhatsappActivas: fila.notificacionesWhatsappActivas,
+      numeroNotificaciones: fila.numeroNotificaciones,
     });
   } catch (error) {
     console.error("Error al actualizar la configuración del bot:", error);

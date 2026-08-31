@@ -10,6 +10,10 @@ export function useBotEstado(token: string | null) {
   // que la dueña confirme cuántos pedidos puede tener listos en paralelo.
   const [duracionFranjaMin, setDuracionFranjaMin] = useState(15)
   const [capacidadPorFranja, setCapacidadPorFranja] = useState(1)
+  // Aviso adicional por WhatsApp (parche para cuando el sonido del dashboard no
+  // es confiable con el celular bloqueado) — no reemplaza el dashboard.
+  const [notificacionesWhatsappActivas, setNotificacionesWhatsappActivas] = useState(false)
+  const [numeroNotificaciones, setNumeroNotificaciones] = useState('')
 
   // Estado inicial vía HTTP: sobrevive a un recargo de página, igual que
   // getPedidosActivos/getClientesEsperando.
@@ -21,6 +25,8 @@ export function useBotEstado(token: string | null) {
         setMensajePausa(c.mensajePausa)
         setDuracionFranjaMin(c.duracionFranjaMin)
         setCapacidadPorFranja(c.capacidadPorFranja)
+        setNotificacionesWhatsappActivas(c.notificacionesWhatsappActivas)
+        setNumeroNotificaciones(c.numeroNotificaciones ?? '')
       })
       .catch((e) => console.warn('No se pudo cargar la configuración del bot:', e))
   }, [token])
@@ -48,5 +54,9 @@ export function useBotEstado(token: string | null) {
     setDuracionFranjaMin,
     capacidadPorFranja,
     setCapacidadPorFranja,
+    notificacionesWhatsappActivas,
+    setNotificacionesWhatsappActivas,
+    numeroNotificaciones,
+    setNumeroNotificaciones,
   }
 }

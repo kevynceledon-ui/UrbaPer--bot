@@ -152,6 +152,10 @@ export interface ConfiguracionBot {
   //Franjas de agenda fuera de horario (ver ADR-002).
   duracionFranjaMin: number
   capacidadPorFranja: number
+  //Aviso adicional por WhatsApp al número de turno cuando llega un pedido nuevo
+  //(parche para cuando el sonido del dashboard no es confiable, celular bloqueado).
+  notificacionesWhatsappActivas: boolean
+  numeroNotificaciones: string | null
 }
 
 function mapearConfiguracion(data: any): ConfiguracionBot {
@@ -160,6 +164,8 @@ function mapearConfiguracion(data: any): ConfiguracionBot {
     mensajePausa: data.mensajePausa,
     duracionFranjaMin: data.duracionFranjaMin,
     capacidadPorFranja: data.capacidadPorFranja,
+    notificacionesWhatsappActivas: data.notificacionesWhatsappActivas,
+    numeroNotificaciones: data.numeroNotificaciones,
   }
 }
 

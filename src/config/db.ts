@@ -286,6 +286,11 @@ class ConfiguracionBot extends Model<InferAttributes<ConfiguracionBot>, InferCre
   //Cuántos pedidos programados caben en la misma franja. Valor temporal (1) hasta
   //que la dueña confirme cuántos puede tener listos en paralelo.
   declare capacidadPorFranja: CreationOptional<number>;
+  //Aviso adicional por WhatsApp al número de quien está de turno cuando llega un
+  //pedido nuevo — parche para cuando el sonido del dashboard no es confiable
+  //(celular bloqueado). No reemplaza el dashboard, solo avisa que hay algo nuevo.
+  declare notificacionesWhatsappActivas: CreationOptional<boolean>;
+  declare numeroNotificaciones: CreationOptional<string | null>;
 }
 
 ConfiguracionBot.init(
@@ -314,6 +319,16 @@ ConfiguracionBot.init(
       type: DataTypes.INTEGER,
       allowNull: false,
       defaultValue: 1,
+    },
+    notificacionesWhatsappActivas: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    numeroNotificaciones: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: null,
     },
   },
   { sequelize, modelName: "ConfiguracionBot" }
