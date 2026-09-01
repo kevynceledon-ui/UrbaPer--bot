@@ -3,7 +3,7 @@ import type { Socket } from 'socket.io-client'
 import type { Order } from '../types/order'
 import { getSocket, disconnectSocket } from '../services/socket'
 import { playNotificationSound } from '../utils/audio'
-import { getPedidosActivos, marcarPedidoEntregado, marcarPedidoNoLlego } from '../services/api'
+import { getPedidosActivos, marcarPedidoEntregado, marcarPedidoNoLlego, marcarPedidoCancelado } from '../services/api'
 
 export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
   const [orders, setOrders] = useState<Order[]>([])
@@ -103,11 +103,20 @@ export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
     }
   }, [token])
 
+  // Cliente pidió cancelar mientras el pedido ya estaba en curso (distinto del
+  // caso de "No llegó": acá el equipo se entera antes de que llegue a buscarlo).
+  const cancelarPedido = useCallback((id: string | number) => {
+    setOrders((prev) => prev.filter(o => String(o.id) !== String(id)))
+    if (token) {
+      marcarPedidoCancelado(id, token).catch((e) => console.warn('[Pedidos] No se pudo cancelar el pedido:', e))
+    }
+  }, [token])
+
   // Exponer disconnect manual para logout
   const disconnect = useCallback(() => {
     disconnectSocket()
     setConnectionState('disconnected')
   }, [])
 
-  return { orders, lastOrder, connectionState, clearOrders, removeOrder, marcarNoLlego, disconnect, setOrders }
+  return { orders, lastOrder, connectionState, clearOrders, removeOrder, marcarNoLlego, cancelarPedido, disconnect, setOrders }
 }

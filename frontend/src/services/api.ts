@@ -109,6 +109,13 @@ export function marcarPedidoNoLlego(id: string | number, token: string): Promise
   return actualizarEstadoPedido(id, 'cancelado', token)
 }
 
+//Mismo estado que "No llegó" (el modelo no distingue el motivo), pero para el
+//caso de un cliente que pide cancelar mientras el pedido ya está en curso —
+//el dashboard lo confirma con un texto distinto antes de llamar a esto.
+export function marcarPedidoCancelado(id: string | number, token: string): Promise<void> {
+  return actualizarEstadoPedido(id, 'cancelado', token)
+}
+
 //Clientes que pidieron hablar con una persona y el bot todavía tiene pausado.
 export async function getClientesEsperando(token: string): Promise<import('../types/order').ClienteEsperando[]> {
   const res = await fetch(`${API_URL}/api/clientes/necesitan-humano`, {

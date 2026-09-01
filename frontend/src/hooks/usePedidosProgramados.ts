@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import type { Socket } from 'socket.io-client'
 import type { Order } from '../types/order'
 import { getSocket } from '../services/socket'
-import { getPedidosProgramados } from '../services/api'
+import { getPedidosProgramados, marcarPedidoCancelado } from '../services/api'
 
 //Pedidos agendados fuera de horario (ver ADR-002): sección separada del
 //dashboard, alimentada por su propio evento de socket para no mezclarse con el
@@ -40,5 +40,13 @@ export function usePedidosProgramados(token: string | null) {
     return () => { cancelado = true }
   }, [token])
 
-  return { pedidos }
+  // Cliente pidió cancelar un pedido agendado antes de que llegue su hora.
+  const cancelarProgramado = useCallback((id: string | number) => {
+    setPedidos((prev) => prev.filter((p) => String(p.id) !== String(id)))
+    if (token) {
+      marcarPedidoCancelado(id, token).catch((e) => console.warn('[Pedidos] No se pudo cancelar el pedido programado:', e))
+    }
+  }, [token])
+
+  return { pedidos, cancelarProgramado }
 }

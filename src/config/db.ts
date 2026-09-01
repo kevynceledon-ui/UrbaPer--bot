@@ -103,6 +103,10 @@ class Producto extends Model<InferAttributes<Producto>, InferCreationAttributes<
   //Orden dentro de su categoría en el listado del bot (no estaba en el pedido
   //original, pero hace falta para que el orden no dependa del azar de la DB).
   declare orden: CreationOptional<number>;
+  //Minutos de cocina para UN plato de este producto, usado por
+  //calcularTiempoPedido() en whatsappServices.ts para estimar la demora real en
+  //vez de una fórmula genérica por cantidad de pedidos en cola.
+  declare tiempoPreparacionMin: CreationOptional<number>;
 }
 
 Producto.init(
@@ -133,6 +137,11 @@ Producto.init(
       type: DataTypes.INTEGER,
       allowNull: false,
       defaultValue: 0,
+    },
+    tiempoPreparacionMin: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 15,
     },
   },
   { sequelize, modelName: "Producto" }
@@ -291,6 +300,13 @@ class ConfiguracionBot extends Model<InferAttributes<ConfiguracionBot>, InferCre
   //(celular bloqueado). No reemplaza el dashboard, solo avisa que hay algo nuevo.
   declare notificacionesWhatsappActivas: CreationOptional<boolean>;
   declare numeroNotificaciones: CreationOptional<string | null>;
+  //Factores del cálculo de demora por cocina paralela (ver calcularTiempoPedido
+  //en whatsappServices.ts): el plato más lento marca el mínimo, y el resto de
+  //platos del mismo pedido suma solo una fracción de su tiempo (se cocinan en
+  //paralelo, no uno detrás del otro). Configurables sin redeploy porque son un
+  //supuesto del negocio, no una constante técnica.
+  declare factorParaleloMin: CreationOptional<number>;
+  declare factorParaleloMax: CreationOptional<number>;
 }
 
 ConfiguracionBot.init(
@@ -310,10 +326,13 @@ ConfiguracionBot.init(
       allowNull: false,
       defaultValue: "En este momento no estamos tomando pedidos por este medio. Por favor intenta más tarde o comunícate directamente con el local.",
     },
+    //30 min: tamaño de bloque que se le MUESTRA al cliente para agendar (menos
+    //opciones, sin números de dos dígitos con emoji). capacidadPorFranja sigue
+    //operando sobre este mismo bloque, sin lógica aparte.
     duracionFranjaMin: {
       type: DataTypes.INTEGER,
       allowNull: false,
-      defaultValue: 15,
+      defaultValue: 30,
     },
     capacidadPorFranja: {
       type: DataTypes.INTEGER,
@@ -329,6 +348,16 @@ ConfiguracionBot.init(
       type: DataTypes.STRING,
       allowNull: true,
       defaultValue: null,
+    },
+    factorParaleloMin: {
+      type: DataTypes.FLOAT,
+      allowNull: false,
+      defaultValue: 0.3,
+    },
+    factorParaleloMax: {
+      type: DataTypes.FLOAT,
+      allowNull: false,
+      defaultValue: 0.5,
     },
   },
   { sequelize, modelName: "ConfiguracionBot" }

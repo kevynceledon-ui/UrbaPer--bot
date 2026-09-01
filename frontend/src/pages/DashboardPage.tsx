@@ -42,7 +42,7 @@ export function DashboardPage() {
   const { isSupported: wakeSupported, isLocked: wakeLocked, error: wakeError, request: requestWakeLock } = useWakeLock(shiftStarted)
 
   // Socket solo si hay token
-  const { orders, lastOrder, connectionState, removeOrder, marcarNoLlego, disconnect } = useOrdersSocket(token, audioUnlocked)
+  const { orders, lastOrder, connectionState, removeOrder, marcarNoLlego, cancelarPedido, disconnect } = useOrdersSocket(token, audioUnlocked)
   const { qr: whatsappQr } = useWhatsappStatus(token)
   const { clientes: clientesEsperando, devolverAlBot } = useClientesEsperando(token)
   const {
@@ -59,7 +59,7 @@ export function DashboardPage() {
     numeroNotificaciones,
     setNumeroNotificaciones,
   } = useBotEstado(token)
-  const { pedidos: pedidosProgramados } = usePedidosProgramados(token)
+  const { pedidos: pedidosProgramados, cancelarProgramado } = usePedidosProgramados(token)
   const [highlightId, setHighlightId] = useState<string | number | null>(null)
 
   // Resalta la tarjeta del último pedido real recibido por socket ("¡NUEVO!")
@@ -85,6 +85,19 @@ export function DashboardPage() {
       }
     })
   }, [token, nav])
+
+  // Cliente pidió cancelar un pedido ya confirmado (en cocina o agendado). Con
+  // confirmación porque, a diferencia de "No llegó", acá se está deteniendo
+  // algo que puede seguir en preparación.
+  const handleCancelarActivo = useCallback((id: string | number) => {
+    if (!window.confirm('¿Cancelar este pedido? El cliente ya no lo recibirá.')) return
+    cancelarPedido(id)
+  }, [cancelarPedido])
+
+  const handleCancelarProgramado = useCallback((id: string | number) => {
+    if (!window.confirm('¿Cancelar este pedido agendado? El cliente ya no lo recibirá.')) return
+    cancelarProgramado(id)
+  }, [cancelarProgramado])
 
   const handleStartShift = useCallback(async () => {
     // Wake Lock primero, sin ningún `await` antes: Safari es estricto con la
@@ -434,7 +447,7 @@ export function DashboardPage() {
               Pedidos programados · {pedidosProgramados.length}
             </h2>
             {pedidosProgramados.map((o) => (
-              <OrderCard key={String(o.id)} order={o} />
+              <OrderCard key={String(o.id)} order={o} onCancelar={handleCancelarProgramado} />
             ))}
           </div>
         )}
@@ -468,7 +481,7 @@ export function DashboardPage() {
         ) : (
           <div className="space-y-3" aria-live="polite" aria-relevant="additions">
             {orders.map(o => (
-              <OrderCard key={String(o.id)} order={o} isNew={String(o.id) === String(highlightId)} onDismiss={removeOrder} onNoLlego={marcarNoLlego} />
+              <OrderCard key={String(o.id)} order={o} isNew={String(o.id) === String(highlightId)} onDismiss={removeOrder} onNoLlego={marcarNoLlego} onCancelar={handleCancelarActivo} />
             ))}
           </div>
         )}

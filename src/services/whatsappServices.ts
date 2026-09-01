@@ -11,7 +11,7 @@ import { rm } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { Op } from "sequelize";
-import { estaAbierto, calcularFranjasDisponibles, horaChileAFecha, formatHoraChile } from "../utils/horario.js";
+import { estaAbierto as estaAbiertoSegunHorario, calcularFranjasDisponibles, horaChileAFecha, formatHoraChile } from "../utils/horario.js";
 
 //Memoria temporal.
 const estadosUsuarios: Record<string, string> = {};
@@ -20,6 +20,9 @@ interface CarritoItem {
   productoId: string;
   nombre: string;
   precio: number;
+  //Usado por calcularTiempoPedido() para estimar la demora real de cocina en
+  //vez de una fórmula genérica por cantidad de pedidos en cola.
+  tiempoPreparacionMin: number;
 }
 const carritos: Record<string, CarritoItem[]> = {};
 //Último listado de códigos mostrado a cada cliente (categoría elegida o "ver todo
@@ -63,6 +66,19 @@ const simulacionHorarioPorNumero = new Map<string, "cerrado" | "abierto">();
 function simulacionHorario(numeroTelefono: string): "cerrado" | "abierto" | null {
   if (process.env.NODE_ENV === "production") return null;
   return simulacionHorarioPorNumero.get(numeroTelefono) ?? null;
+}
+
+//Única fuente de verdad para "¿el local está abierto ahora mismo, para este
+//número?" — respeta el modo prueba (/simular) antes de consultar el horario
+//real. TODO el código debe llamar a ESTA función, nunca a
+//horario.ts::estaAbierto() directo, para que el override no se pueda olvidar
+//al agregar un punto nuevo del flujo (ver bug real: el disparo de
+//ELIGIENDO_HORA_PROGRAMADA lo decidía por su cuenta, ignorando /simular).
+async function estaAbierto(numeroTelefono: string): Promise<boolean> {
+  const simulacion = simulacionHorario(numeroTelefono);
+  if (simulacion === "abierto") return true;
+  if (simulacion === "cerrado") return false;
+  return estaAbiertoSegunHorario();
 }
 
 //Import de las tablas
@@ -135,6 +151,9 @@ interface ConfiguracionBotCache {
   //más abajo) — parche para cuando el sonido del dashboard no es confiable.
   notificacionesWhatsappActivas: boolean;
   numeroNotificaciones: string | null;
+  //Factores del cálculo de demora por cocina paralela (ver calcularTiempoPedido).
+  factorParaleloMin: number;
+  factorParaleloMax: number;
 }
 
 let configuracionBot: ConfiguracionBotCache = {
@@ -144,6 +163,8 @@ let configuracionBot: ConfiguracionBotCache = {
   capacidadPorFranja: 1,
   notificacionesWhatsappActivas: false,
   numeroNotificaciones: null,
+  factorParaleloMin: 0.3,
+  factorParaleloMax: 0.5,
 };
 
 export async function cargarConfiguracionBot(): Promise<void> {
@@ -159,6 +180,8 @@ export async function cargarConfiguracionBot(): Promise<void> {
       capacidadPorFranja: fila.capacidadPorFranja,
       notificacionesWhatsappActivas: fila.notificacionesWhatsappActivas,
       numeroNotificaciones: fila.numeroNotificaciones,
+      factorParaleloMin: fila.factorParaleloMin,
+      factorParaleloMax: fila.factorParaleloMax,
     };
   } catch (e) {
     console.warn("No se pudo cargar la configuración del bot, se usa el valor por defecto (activo):", e);
@@ -203,7 +226,7 @@ async function generarMenuCategoria(
     });
     const lineas = productos.map((p) => {
       contador++;
-      codigos[String(contador)] = { productoId: p.id, nombre: p.nombre, precio: p.precio };
+      codigos[String(contador)] = { productoId: p.id, nombre: p.nombre, precio: p.precio, tiempoPreparacionMin: p.tiempoPreparacionMin };
       return `${numeroEmoji(contador)} ${p.nombre} - $${p.precio.toLocaleString("es-CL")}`;
     });
     const texto = `*${categoria?.nombre ?? "Menú"}*\n\n${lineas.join("\n")}\n\n👉 *Escribe el número del plato para agregarlo, o "listo" para ver las categorías de nuevo.*`;
@@ -220,7 +243,7 @@ async function generarMenuCategoria(
     if (productos.length === 0) continue;
     const lineas = productos.map((p) => {
       contador++;
-      codigos[String(contador)] = { productoId: p.id, nombre: p.nombre, precio: p.precio };
+      codigos[String(contador)] = { productoId: p.id, nombre: p.nombre, precio: p.precio, tiempoPreparacionMin: p.tiempoPreparacionMin };
       return `${numeroEmoji(contador)} ${p.nombre} - $${p.precio.toLocaleString("es-CL")}`;
     });
     bloques.push(`*${categoria.nombre}*\n${lineas.join("\n")}`);
@@ -237,9 +260,7 @@ async function mostrarMenuOAgendar(
   responder: (texto: string) => Promise<unknown>,
   prefijoSiAbierto = ""
 ): Promise<void> {
-  const simulacion = simulacionHorario(numeroTelefono);
-  const abierto = simulacion === "abierto" ? true : simulacion === "cerrado" ? false : await estaAbierto();
-  if (!abierto) {
+  if (!(await estaAbierto(numeroTelefono))) {
     const franjas = await calcularFranjasDisponibles(configuracionBot.duracionFranjaMin, configuracionBot.capacidadPorFranja);
     if (franjas.length === 0) {
       await responder(MENSAJE_CERRADO_SIN_AGENDA);
@@ -295,16 +316,57 @@ function formatResumenCarrito(
   return { texto, total };
 }
 
-//Cuenta pedidos activos (pendiente/preparando) creados en la última hora, para
-//estimar la demora de cocina. Un pedido olvidado por el staff más allá de 60 min
-//deja de inflar la demora de los demás (sin tocar su estado real).
-async function calcularTiempoEstimado(): Promise<{ min: number; max: number }> {
+//Demora de UN pedido cocinado en paralelo: el plato más lento marca el mínimo
+//posible (no se puede entregar antes que él), y el resto de platos del mismo
+//pedido suma solo una fracción de su tiempo (se cocinan al mismo tiempo, no uno
+//detrás del otro) — factorParaleloMin/Max son configurables desde ConfiguracionBot.
+function calcularTiempoPedido(items: { tiempoPreparacionMin: number }[]): { min: number; max: number } {
+  if (items.length === 0) return { min: 0, max: 0 };
+  const tiempos = items.map((i) => i.tiempoPreparacionMin);
+  const platoMasLento = Math.max(...tiempos);
+  const restoSuma = tiempos.reduce((suma, t) => suma + t, 0) - platoMasLento;
+  return {
+    min: Math.round(platoMasLento + configuracionBot.factorParaleloMin * restoSuma),
+    max: Math.round(platoMasLento + configuracionBot.factorParaleloMax * restoSuma),
+  };
+}
+
+//Suma calcularTiempoPedido() de cada pedido activo (pendiente/preparando, sin
+//contar uno agendado que todavía no llega su hora) más el pedido que se está
+//creando ahora. Reemplaza la vieja fórmula de "n × minutos fijos por pedido en
+//cola", que no distinguía un pedido de un plato de uno de cinco. Un pedido
+//olvidado por el staff más allá de 60 min deja de inflar la demora de los demás
+//(sin tocar su estado real).
+async function calcularTiempoEstimado(itemsNuevoPedido: CarritoItem[]): Promise<{ min: number; max: number }> {
   const haceUnaHora = new Date(Date.now() - 60 * 60 * 1000);
-  const nAnteriores = await Pedido.count({
-    where: { estado: { [Op.in]: ["pendiente", "preparando"] }, createdAt: { [Op.gte]: haceUnaHora } },
+  const ahora = new Date();
+  const pedidosActivos = await Pedido.findAll({
+    where: {
+      estado: { [Op.in]: ["pendiente", "preparando"] },
+      createdAt: { [Op.gte]: haceUnaHora },
+      [Op.or]: [{ horaProgramada: null }, { horaProgramada: { [Op.lte]: ahora } }],
+    },
+    include: [{ model: DetallePedido, include: [{ model: Producto }] }],
   });
-  const n = nAnteriores + 1; // incluye el pedido que se está creando ahora
-  return { min: Math.min(15 * n, 60), max: Math.min(20 * n, 60) };
+
+  let minTotal = 0;
+  let maxTotal = 0;
+  for (const pedido of pedidosActivos) {
+    const items = (pedido.DetallePedidos ?? []).flatMap((detalle) =>
+      Array.from({ length: detalle.cantidad }, () => ({
+        tiempoPreparacionMin: detalle.Producto?.tiempoPreparacionMin ?? 15,
+      }))
+    );
+    const { min, max } = calcularTiempoPedido(items);
+    minTotal += min;
+    maxTotal += max;
+  }
+
+  const nuevo = calcularTiempoPedido(itemsNuevoPedido);
+  minTotal += nuevo.min;
+  maxTotal += nuevo.max;
+
+  return { min: Math.min(minTotal, 60), max: Math.min(maxTotal, 60) };
 }
 
 //Logger silencioso: Baileys es muy verboso por defecto (loguea cada paquete de protocolo).
@@ -622,7 +684,7 @@ async function manejarMensaje(
       });
       // Un pedido agendado ya tiene una hora comprometida — no tiene sentido
       // mostrarle además un rango de espera "en vivo" (ver ADR-002).
-      const tiempoEstimado = horaProgramada ? null : await calcularTiempoEstimado();
+      const tiempoEstimado = horaProgramada ? null : await calcularTiempoEstimado(miCarrito);
       const lineaTiempo = horaProgramada
         ? `🗓️ Tu pedido quedó agendado para las ${formatHoraChile(horaProgramada)}.`
         : `⏱️ Tiempo estimado: ${tiempoEstimado!.min}-${tiempoEstimado!.max} min`;
@@ -638,6 +700,14 @@ async function manejarMensaje(
       //garantía antes de empezar a cocinar.
       let noShows = 0;
       try {
+        // Diagnóstico: se detectaron pedidos guardados con cliente_id NULL (el
+        // teléfono no aparece en el dashboard) sin poder reproducir la causa por
+        // lectura de código — si vuelve a pasar, este log debería decir por qué
+        // `cliente` llegó roto hasta acá.
+        if (!cliente?.id) {
+          console.error("[BUG cliente_id] cliente inválido al crear el pedido:", { numeroTelefono, cliente, fueCreado });
+        }
+
         noShows = await Pedido.count({ where: { cliente_id: cliente.id, estado: "cancelado" } });
 
         const nuevoPedido = await Pedido.create({
@@ -725,8 +795,18 @@ async function manejarMensaje(
           : modalidad === "retiro"
             ? "🏪 retiro en local"
             : "🛵 delivery";
+        console.log(`[WhatsApp] Enviando aviso de pedido nuevo a ${configuracionBot.numeroNotificaciones}...`);
         await notificarStaff(
           `🔔 *Pedido nuevo* — ${cliente.nombre}\n${miCarrito.length} plato(s) · $${total.toLocaleString("es-CL")} · ${avisoModalidad}\n\nRevisa el dashboard para los detalles.`
+        );
+        console.log("[WhatsApp] Aviso de pedido nuevo enviado sin errores.");
+      } else {
+        // Diagnóstico: si esto aparece, el aviso no se manda porque la caché en
+        // memoria no ve el toggle activado o el número — aunque la DB lo tenga
+        // guardado bien, puede que este proceso arrancó antes de guardarlo, o que
+        // cargarConfiguracionBot() falló al arrancar (ver warning más arriba).
+        console.log(
+          `[WhatsApp] Aviso de pedido nuevo NO enviado — notificacionesWhatsappActivas=${configuracionBot.notificacionesWhatsappActivas}, numeroNotificaciones=${configuracionBot.numeroNotificaciones ?? "null"}`
         );
       }
       // ===============================================================

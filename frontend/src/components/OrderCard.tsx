@@ -1,6 +1,7 @@
 import {
   CheckCircle2,
   XCircle,
+  Ban,
   Bike,
   Store,
   Banknote,
@@ -59,9 +60,10 @@ type Props = {
   isNew?: boolean
   onDismiss?: (id: string | number) => void
   onNoLlego?: (id: string | number) => void
+  onCancelar?: (id: string | number) => void
 }
 
-export function OrderCard({ order, isNew, onDismiss, onNoLlego }: Props) {
+export function OrderCard({ order, isNew, onDismiss, onNoLlego, onCancelar }: Props) {
   const tel = numeroLimpio(order.cliente.telefono)
   const telIntl = tel.startsWith('56') ? tel : `56${tel}`
   const waUrl = `https://wa.me/${telIntl}?text=${encodeURIComponent(`Hola ${order.cliente.nombre}, tu pedido #${order.id} está en preparación 🍗`)}`
@@ -115,6 +117,19 @@ export function OrderCard({ order, isNew, onDismiss, onNoLlego }: Props) {
             >
               <XCircle className="h-3.5 w-3.5" />
               No llegó
+            </button>
+          )}
+          {/* Distinto de "No llegó": acá el cliente avisó ANTES de venir a buscarlo,
+              mientras el pedido ya podía estar en cocina. Misma zona quieta, lejos
+              de "Listo", para que no se confunda con la acción principal. */}
+          {onCancelar && (
+            <button
+              onClick={() => onCancelar(order.id)}
+              className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-semibold text-zinc-500 transition hover:text-red-400"
+              aria-label={`Cancelar pedido ${order.id}`}
+            >
+              <Ban className="h-3.5 w-3.5" />
+              Cancelar
             </button>
           )}
         </div>
