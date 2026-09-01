@@ -95,11 +95,15 @@ router.get("/pedidos", authenticateToken, async (_req, res) => {
  * Pedidos agendados fuera de horario (ver ADR-002) cuya hora todavía no llega —
  * sección separada del dashboard, para no mezclarlos con lo urgente de ahora.
  * Ordenados por hora comprometida, no por fecha de creación.
+ *
+ * En cuanto la hora comprometida llega, el pedido debe pasar a GET /api/pedidos
+ * (con el botón "Listo") y desaparecer de acá — por eso el mismo corte
+ * "horaProgramada > ahora" que usa GET /api/pedidos, en espejo.
  */
 router.get("/pedidos/programados", authenticateToken, async (_req, res) => {
   try {
     const pedidos = await Pedido.findAll({
-      where: { estado: ESTADOS_ACTIVOS, horaProgramada: { [Op.ne]: null } },
+      where: { estado: ESTADOS_ACTIVOS, horaProgramada: { [Op.gt]: new Date() } },
       order: [["horaProgramada", "ASC"]],
       include: [
         { model: Cliente },

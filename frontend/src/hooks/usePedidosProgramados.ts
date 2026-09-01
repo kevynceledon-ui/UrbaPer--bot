@@ -24,20 +24,26 @@ export function usePedidosProgramados(token: string | null) {
     }
   }, [token])
 
+  // Se repite cada 60s: en cuanto la hora agendada llega, el backend deja de
+  // devolver ese pedido acá (pasa a GET /api/pedidos, con el botón "Listo") —
+  // sin este refresco periódico se quedaba mostrado acá para siempre, sin
+  // "Listo", hasta que alguien recargara la página a mano. Por eso reemplaza
+  // la lista completa con lo que diga el servidor en vez de solo agregar: así
+  // también se cae el que ya venció, no solo se suman los nuevos.
   useEffect(() => {
     if (!token) return
     let cancelado = false
-    getPedidosProgramados(token)
-      .then((pedidos) => {
-        if (cancelado) return
-        setPedidos((prev) => {
-          const idsExistentes = new Set(prev.map((p) => p.id))
-          const nuevos = pedidos.filter((p) => !idsExistentes.has(p.id))
-          return [...prev, ...nuevos]
+    const cargar = () => {
+      getPedidosProgramados(token)
+        .then((pedidos) => {
+          if (cancelado) return
+          setPedidos(pedidos)
         })
-      })
-      .catch((e) => console.warn('[Pedidos] No se pudieron cargar los pedidos programados:', e))
-    return () => { cancelado = true }
+        .catch((e) => console.warn('[Pedidos] No se pudieron cargar los pedidos programados:', e))
+    }
+    cargar()
+    const intervalo = setInterval(cargar, 60000)
+    return () => { cancelado = true; clearInterval(intervalo) }
   }, [token])
 
   // Cliente pidió cancelar un pedido agendado antes de que llegue su hora.

@@ -68,20 +68,28 @@ export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
   // Recupera los pedidos activos guardados en BD al montar (o si cambia el token):
   // sin esto, recargar la página (ej. el celular descarga la pestaña en segundo
   // plano) deja el dashboard vacío hasta que llegue un pedido nuevo por socket.
+  // Se repite cada 60s (no solo al montar): un pedido agendado (ver ADR-002) no
+  // dispara ningún evento de socket cuando llega su hora — sin este refresco se
+  // quedaba atascado en "Pedidos programados", sin botón "Listo", hasta que
+  // alguien recargara la página a mano.
   useEffect(() => {
     if (!token) return
     let cancelado = false
-    getPedidosActivos(token)
-      .then((pedidos) => {
-        if (cancelado) return
-        setOrders((prev) => {
-          const idsExistentes = new Set(prev.map((o) => String(o.id)))
-          const nuevos = pedidos.filter((p) => !idsExistentes.has(String(p.id)))
-          return [...prev, ...nuevos]
+    const cargar = () => {
+      getPedidosActivos(token)
+        .then((pedidos) => {
+          if (cancelado) return
+          setOrders((prev) => {
+            const idsExistentes = new Set(prev.map((o) => String(o.id)))
+            const nuevos = pedidos.filter((p) => !idsExistentes.has(String(p.id)))
+            return nuevos.length > 0 ? [...prev, ...nuevos] : prev
+          })
         })
-      })
-      .catch((e) => console.warn('[Pedidos] No se pudieron cargar pedidos activos:', e))
-    return () => { cancelado = true }
+        .catch((e) => console.warn('[Pedidos] No se pudieron cargar pedidos activos:', e))
+    }
+    cargar()
+    const intervalo = setInterval(cargar, 60000)
+    return () => { cancelado = true; clearInterval(intervalo) }
   }, [token])
 
   const clearOrders = useCallback(() => setOrders([]), [])
