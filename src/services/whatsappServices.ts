@@ -675,6 +675,40 @@ async function manejarMensaje(
       const direccion = direccionesPendientes[numeroTelefono] ?? null;
       const montoRecibido = montosRecibidosPendientes[numeroTelefono] ?? null;
       const horaProgramada = horaProgramadaPendientes[numeroTelefono] ?? null;
+
+      // Revalidación final de la hora agendada (ver ADR-002): la disponibilidad
+      // se chequeó una sola vez, cuando se mostró la lista de horarios, varios
+      // mensajes atrás (modalidad → hora → método de pago → comprobante/monto →
+      // nota → confirmar). Si otro cliente reservó esa misma franja mientras
+      // tanto, sin este chequeo el pedido se creaba igual, duplicando la hora
+      // (bug real reportado: dos pedidos para las 9:30). Se revisa recién acá,
+      // justo antes de guardar, contra el estado actual de la BD.
+      if (horaProgramada) {
+        const finFranja = new Date(horaProgramada.getTime() + configuracionBot.duracionFranjaMin * 60000);
+        const ocupados = await Pedido.count({
+          where: {
+            horaProgramada: { [Op.gte]: horaProgramada, [Op.lt]: finFranja },
+            estado: { [Op.ne]: "cancelado" },
+          },
+        });
+        if (ocupados >= configuracionBot.capacidadPorFranja) {
+          const franjas = await calcularFranjasDisponibles(configuracionBot.duracionFranjaMin, configuracionBot.capacidadPorFranja);
+          delete horaProgramadaPendientes[numeroTelefono];
+          if (franjas.length === 0) {
+            delete pedidosProgramadosPendientes[numeroTelefono];
+            delete franjasPendientes[numeroTelefono];
+            estadosUsuarios[numeroTelefono] = "CONFIRMANDO_PEDIDO";
+            await responder("😕 Justo se acaba de ocupar ese horario y no quedan más disponibles por hoy. Escribe *SI* para mandarlo en tiempo real apenas abramos, o *NO* para seguir editando.");
+            return;
+          }
+          franjasPendientes[numeroTelefono] = franjas;
+          estadosUsuarios[numeroTelefono] = "ELIGIENDO_HORA_PROGRAMADA";
+          const lista = franjas.map((f, i) => `${numeroEmoji(i + 1)} ${f.inicio}-${f.fin}`).join("\n");
+          await responder(`😕 Justo se acaba de ocupar ese horario. Elige otro:\n\n${lista}`);
+          return;
+        }
+      }
+
       const { texto: resumenItems, total } = formatResumenCarrito(miCarrito, nota, {
         metodoPago,
         modalidad: modalidad ?? undefined,
