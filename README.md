@@ -42,6 +42,83 @@ Este proyecto tiene bastante más lógica de negocio real de la que un bot de me
 - **Agenda de horarios como menú cerrado, no texto libre.** El cliente nunca escribe una hora a mano — elige entre franjas ya validadas contra la capacidad real, eliminando por diseño el caso de "pedí una hora que ya estaba llena".
 - **Separación estricta entre "vitrina" y "canal de compra"** respecto al catálogo nativo de WhatsApp Business: se evaluó integrar el catálogo como canal de pedido directo (`orderMessage` + `getOrderDetails`, protocolo no documentado de Baileys) y se decidió postergarlo — ver Roadmap.
 
+## 🗂️ Modelo de datos
+
+```mermaid
+erDiagram
+    CLIENTE ||--o{ PEDIDO : realiza
+    PEDIDO ||--o{ DETALLE_PEDIDO : contiene
+    PRODUCTO ||--o{ DETALLE_PEDIDO : incluye
+    CATEGORIA ||--o{ PRODUCTO : agrupa
+
+    CLIENTE {
+        uuid id PK
+        string telefono UK
+        string nombre
+        datetime necesitaHumanoDesde "para tomar el pedido con un humano"
+    }
+
+    CATEGORIA {
+        uuid id PK
+        string nombre
+        int orden
+    }
+
+    PRODUCTO {
+        uuid id PK
+        string nombre
+        int precio
+        boolean disponible
+        uuid categoriaId FK "nullable: productos históricos sin categoría"
+        int orden
+        int tiempoPreparacionMin "usado en el cálculo de demora"
+    }
+
+    PEDIDO {
+        uuid id PK
+        string estado "comprando/pendiente/preparando/listo/entregado/cancelado"
+        int total
+        string metodoPago "efectivo/transferencia"
+        text comprobanteImagen
+        string modalidad "delivery/retiro"
+        text direccion
+        int montoRecibido "para calcular el vuelto"
+        int tiempoEstimadoMin "congelado al crear el pedido"
+        int tiempoEstimadoMax
+        datetime horaProgramada "null = pedido en tiempo real"
+        uuid cliente_id FK
+    }
+
+    DETALLE_PEDIDO {
+        uuid id PK
+        int cantidad
+        int precio_unitario
+        uuid pedido_id FK
+        uuid producto_id FK
+    }
+
+    CONFIGURACION_BOT {
+        uuid id PK "fila única, singleton"
+        boolean activo "botón de pausa/emergencia"
+        text mensajePausa
+        int duracionFranjaMin
+        int capacidadPorFranja
+        float factorParaleloMin "cálculo de demora por cocina paralela"
+        float factorParaleloMax
+    }
+
+    HORARIO_ATENCION {
+        uuid id PK
+        int diaSemana "0=Domingo...6=Sábado"
+        string horaInicio
+        string horaFin
+    }
+```
+
+`ConfiguracionBot` y `HorarioAtencion` no tienen relaciones (foreign keys) hacia el resto — son configuración global del negocio (horario real, mensaje de pausa, factores de la fórmula de demora), no datos por cliente o por pedido, así que quedan intencionalmente desconectados del resto del modelo.
+
+
+
 ## 🚀 Cómo levantarlo localmente
 
 ```bash
