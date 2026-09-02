@@ -1154,11 +1154,30 @@ export async function iniciarWhatsapp(): Promise<void> {
     }
   });
 
+  //Baileys puede reentregar el mismo mensaje más de una vez (reconexiones,
+  //reintentos de ack) — sin este chequeo, un solo "1" del cliente se procesaba
+  //dos veces y duplicaba el ítem en el carrito (bug real reportado: mismo
+  //plato x2 en el mismo pedido sin que el cliente lo haya escrito dos veces).
+  // Acotado en tamaño y recreado en cada reconexión (vive en el scope de
+  // iniciarWhatsapp), no necesita expirar por tiempo.
+  const mensajesProcesados = new Set<string>();
+  const MAX_MENSAJES_PROCESADOS = 1000;
+
   sock.ev.on("messages.upsert", ({ messages, type }) => {
     if (type !== "notify") return;
 
     for (const msg of messages) {
       void (async () => {
+        const msgId = msg.key.id;
+        if (msgId) {
+          if (mensajesProcesados.has(msgId)) return;
+          mensajesProcesados.add(msgId);
+          if (mensajesProcesados.size > MAX_MENSAJES_PROCESADOS) {
+            const masAntiguo = mensajesProcesados.values().next().value;
+            if (masAntiguo) mensajesProcesados.delete(masAntiguo);
+          }
+        }
+
         const jid = msg.key.remoteJid;
         if (!jid) return;
 
