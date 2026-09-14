@@ -100,12 +100,6 @@ function normalizarTexto(texto: string): string {
     .replace(/\s+/g, " ");
 }
 
-const PATRON_SALUDO =
-  /^(h*o+l+a+|hey+|holis|buen[oa]s?(\s+(dias?|tardes?|noches?))?|que\s*tal|buenas)$/;
-
-function esSaludo(textoCliente: string): boolean {
-  return PATRON_SALUDO.test(normalizarTexto(textoCliente));
-}
 
 const PATRON_CONSULTA_ESTADO = /\b(abiert|cerrad|atend|disponib|abren)\w*\b/;
 
@@ -870,15 +864,25 @@ async function manejarMensaje(
       return;
     }
 
-    // 3. LÓGICA DEL SALUDO (tolerante a variantes/typos: ola, buenas, buenos días...)
-    // y de preguntas de "¿están abiertos/atendiendo/disponibles?". Ninguna de las
-    // dos debe interrumpir un pedido ya en curso.
+    // 3. LÓGICA DEL SALUDO y de preguntas de "¿están abiertos/atendiendo/disponibles?".
+    // Ninguna de las dos debe interrumpir un pedido ya en curso.
     if (estadosUsuarios[numeroTelefono] !== "REALIZANDO_PEDIDO" && esConsultaEstado(textoCliente)) {
       await mostrarMenuOAgendar(numeroTelefono, responder, "✅ ¡Sí, estamos atendiendo! 🇵🇪\n\n");
       return;
     }
 
-    if (estadosUsuarios[numeroTelefono] !== "REALIZANDO_PEDIDO" && esSaludo(textoCliente)) {
+    // No intentamos reconocer cada variante de "hola" (wena, wenas, wenos días,
+    // holaaaa, ola, etc. — son infinitas). En este punto del flujo el estado solo
+    // puede ser "sin pedido activo" o REALIZANDO_PEDIDO (todo estado intermedio ya
+    // hizo return más arriba), y los únicos comandos válidos en estado idle son
+    // "1" y "2" (enrutador principal, abajo). Cualquier otro texto de un cliente
+    // idle no tiene otro significado posible que "está iniciando la conversación",
+    // así que la bienvenida es la respuesta por defecto — no un saludo detectado.
+    if (
+      estadosUsuarios[numeroTelefono] !== "REALIZANDO_PEDIDO" &&
+      textoCliente !== "1" &&
+      textoCliente !== "2"
+    ) {
       if (fueCreado || !cliente.nombre || cliente.nombre.trim() === "Por definir") {
         estadosUsuarios[numeroTelefono] = "ESPERANDO_NOMBRE";
         await responder("¡Hola! Soy el asistente virtual de UrbanPerú 🇵🇪. Veo que es tu primera vez pidiendo con nosotros. ¿Me podrías decir tu nombre para registrarte?");
