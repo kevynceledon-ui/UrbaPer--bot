@@ -11,6 +11,7 @@ import authRoutes from "./routes/auth.js";
 import pedidosRoutes from "./routes/pedidos.js";
 import clientesRoutes from "./routes/clientes.js";
 import whatsappRoutes from "./routes/whatsapp.js";
+import whatsappWebhookRoutes from "./routes/whatsappWebhook.js";
 import configuracionRoutes from "./routes/configuracion.js";
 import { iniciarWhatsapp } from "./services/whatsappServices.js";
 
@@ -71,16 +72,28 @@ const globalLimiter = rateLimit({
   max: 100, // 100 requests por IP cada 15 min
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => req.path === "/ping",
+  // /ping: ver arriba. /whatsapp/webhook: Meta reintenta agresivo si no hay ack
+  // rápido, y el "cliente" real acá es Meta, no un visitante — limitar por IP no
+  // tiene sentido para tráfico ya autenticado por firma HMAC (ver whatsappWebhook.ts).
+  skip: (req) => req.path === "/ping" || req.path === "/api/whatsapp/webhook",
   message: { ok: false, error: "Demasiadas peticiones. Intenta más tarde." },
 });
 app.use(globalLimiter);
 
+// ===================== RUTAS =====================
+
+// Webhook de WhatsApp Cloud API (ver plan de migración de Baileys a Cloud API):
+// se monta ANTES de express.json() a propósito — necesita el body crudo para
+// verificar la firma HMAC de Meta (X-Hub-Signature-256), y su propia ruta ya
+// trae su propio express.raw() en whatsappWebhook.ts. Si se montara después de
+// express.json(), el body ya vendría parseado/consumido y la firma nunca
+// calzaría. No usa auth JWT (Meta llama esta ruta directo, no un usuario del
+// dashboard) — la autenticidad se valida por firma, no por token.
+app.use("/api", whatsappWebhookRoutes);
+
 // 4. Parsers
 app.use(express.json({ limit: "100kb" })); // limita tamaño body
 app.use(express.urlencoded({ extended: true }));
-
-// ===================== RUTAS =====================
 
 // Ruta health check (sin auth)
 app.get("/ping", (_req, res) => {
@@ -112,9 +125,19 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`Servidor corriendo en http://localhost:${PORT} y http://192.168.1.6:${PORT}`);
   console.log(`CORS permitido para: ${allowedOrigins.join(", ")}`);
 
-  // Inicializa cliente de WhatsApp (async: se maneja con .catch, no con try/catch,
-  // porque el error puede llegar en una promesa rechazada más adelante, no al llamar).
-  iniciarWhatsapp().catch((e) => console.error("Error inicializando WhatsApp:", e));
+  // Transporte de WhatsApp (ver plan de migración de Baileys a Cloud API):
+  // "baileys" (default, hoy) inicia la sesión no oficial de WhatsApp Web;
+  // "cloud" usa la API oficial vía el webhook de arriba y no necesita ninguna
+  // conexión persistente que iniciar acá. Los dos conviven en el código a
+  // propósito durante la migración, pero nunca deben estar ACTIVOS los dos a
+  // la vez (se respondería duplicado a cada cliente).
+  if ((process.env.WHATSAPP_TRANSPORT || "baileys") === "baileys") {
+    // Async: se maneja con .catch, no con try/catch, porque el error puede
+    // llegar en una promesa rechazada más adelante, no al llamar.
+    iniciarWhatsapp().catch((e) => console.error("Error inicializando WhatsApp:", e));
+  } else {
+    console.log("[WhatsApp] Transporte Cloud API activo — esperando webhooks en /api/whatsapp/webhook.");
+  }
 
   try {
     await sequelize.authenticate();

@@ -192,6 +192,13 @@ export function actualizarConfiguracionBotCache(cambios: Partial<ConfiguracionBo
   configuracionBot = { ...configuracionBot, ...cambios };
 }
 
+//Lectura de la caché para transportes fuera de este archivo (ver whatsappWebhook.ts
+//y el plan de migración a Cloud API) — el staff se notifica desde el módulo del
+//transporte, que necesita el número configurado en el dashboard.
+export function getConfiguracionBot(): Readonly<ConfiguracionBotCache> {
+  return configuracionBot;
+}
+
 const emojiDigito: Record<string, string> = {
   "0": "0️⃣", "1": "1️⃣", "2": "2️⃣", "3": "3️⃣", "4": "4️⃣",
   "5": "5️⃣", "6": "6️⃣", "7": "7️⃣", "8": "8️⃣", "9": "9️⃣",
@@ -1006,6 +1013,61 @@ async function manejarMensaje(
   }
 }
 
+//Punto de entrada compartido entre transportes (Baileys hoy, WhatsApp Cloud API
+//en migración — ver plan de migración): cada transporte solo tiene que resolver
+//numeroTelefono/texto/imagen y armar los 3 callbacks (responder, enviarDatosBancarios,
+//notificarStaff) a su manera; toda la lógica de qué hacer con eso vive acá una
+//sola vez, para no duplicarla entre transportes.
+export async function manejarMensajeEntrante(opts: {
+  numeroTelefono: string;
+  texto: string | undefined;
+  imagen: { buffer: Buffer; mimetype: string } | null;
+  responder: (texto: string) => Promise<unknown>;
+  enviarDatosBancarios: () => Promise<void>;
+  notificarStaff: (texto: string) => Promise<unknown>;
+}): Promise<void> {
+  const { numeroTelefono, texto, imagen, responder, enviarDatosBancarios, notificarStaff } = opts;
+
+  //Pausa de emergencia (ver botón del dashboard / ConfiguracionBot): si está
+  //pausado, no se procesa nada más, ni siquiera "reset" o un comprobante en curso.
+  if (!configuracionBot.activo) {
+    await responder(configuracionBot.mensajePausa);
+    return;
+  }
+
+  //Comprobante de transferencia: no pasa por el flujo de solo-texto de abajo.
+  if (estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE" && imagen) {
+    comprobantesPendientes[numeroTelefono] = `data:${imagen.mimetype};base64,${imagen.buffer.toString("base64")}`;
+    if (modalidadesPendientes[numeroTelefono] === "delivery") {
+      estadosUsuarios[numeroTelefono] = "PIDIENDO_DIRECCION";
+      await responder("✅ Comprobante recibido.\n\n📍 Pásame tu dirección de entrega (calle, número, comuna).");
+    } else {
+      estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
+      await responder("✅ Comprobante recibido.\n\n📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
+    }
+    return;
+  }
+
+  //Si el mensaje no tiene texto, lo ignora de inmediato (elimina la basura de
+  //sincronización multimedia: imágenes, stickers, etc.) — salvo que estuviera
+  //esperando el comprobante, donde vale la pena avisarle que mande la imagen.
+  if (!texto || texto.trim() === "") {
+    if (estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE") {
+      await responder("Por favor envía la *imagen* del comprobante de transferencia (foto o captura de pantalla).");
+    }
+    return;
+  }
+
+  await manejarMensaje(numeroTelefono, texto.trim(), responder, enviarDatosBancarios, notificarStaff);
+}
+
+//Para que un transporte (ej. whatsappWebhook.ts) pueda decidir si vale la pena
+//descargar una imagen entrante ANTES de gastar la llamada a la API — solo se
+//necesita cuando el cliente está esperando el comprobante de transferencia.
+export function estaEsperandoComprobante(numeroTelefono: string): boolean {
+  return estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE";
+}
+
 function extraerTexto(msg: WAMessage): string | undefined {
   return msg.message?.conversation ?? msg.message?.extendedTextMessage?.text ?? undefined;
 }
@@ -1211,13 +1273,6 @@ export async function iniciarWhatsapp(): Promise<void> {
           }
         };
 
-        //Pausa de emergencia (ver botón del dashboard / ConfiguracionBot): si está
-        //pausado, no se procesa nada más, ni siquiera "reset" o un comprobante en curso.
-        if (!configuracionBot.activo) {
-          await responder(configuracionBot.mensajePausa);
-          return;
-        }
-
         //Manda la imagen con los datos bancarios (cuenta RUT + logo Mercado Pago) al
         //elegir transferencia. Se define acá porque necesita `sock`/`jid`, que
         //manejarMensaje no tiene.
@@ -1226,42 +1281,32 @@ export async function iniciarWhatsapp(): Promise<void> {
           await sock.sendMessage(jid, { image: datosBancariosBuffer, caption: "🏦 Estos son nuestros datos para la transferencia." });
         };
 
-        //Comprobante de transferencia: es una imagen, no pasa por el filtro de solo-texto
-        //de abajo. Se maneja acá (no en manejarMensaje) porque necesita `sock` para
-        //descargar el archivo.
-        const imagen = msg.message?.imageMessage;
-        if (estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE" && imagen) {
+        //Comprobante de transferencia: es una imagen, no pasa por extraerTexto. Se
+        //descarga acá (no en manejarMensajeEntrante) porque necesita `sock` de Baileys.
+        //Solo si corresponde — una imagen mandada en cualquier otro momento de la
+        //conversación no vale la pena descargarla, se va a ignorar igual.
+        let imagen: { buffer: Buffer; mimetype: string } | null = null;
+        const imagenMsg = msg.message?.imageMessage;
+        if (imagenMsg && estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE") {
           try {
             const buffer = await downloadMediaMessage(msg, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage });
-            const mime = imagen.mimetype || "image/jpeg";
-            comprobantesPendientes[numeroTelefono] = `data:${mime};base64,${buffer.toString("base64")}`;
-            if (modalidadesPendientes[numeroTelefono] === "delivery") {
-              estadosUsuarios[numeroTelefono] = "PIDIENDO_DIRECCION";
-              await responder("✅ Comprobante recibido.\n\n📍 Pásame tu dirección de entrega (calle, número, comuna).");
-            } else {
-              estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
-              await responder("✅ Comprobante recibido.\n\n📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
-            }
+            imagen = { buffer, mimetype: imagenMsg.mimetype || "image/jpeg" };
           } catch (e) {
             console.error("Error descargando comprobante de transferencia:", e);
             await responder("❌ No pude leer esa imagen, ¿puedes volver a enviarla?");
+            return;
           }
-          return;
         }
 
         const texto = extraerTexto(msg);
-        //Si el mensaje no tiene texto, lo ignora de inmediato (elimina la basura de
-        //sincronización multimedia: imágenes, stickers, etc.) — salvo que estuviera
-        //esperando el comprobante, donde vale la pena avisarle que mande la imagen.
-        if (!texto || texto.trim() === "") {
-          if (estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE") {
-            await responder("Por favor envía la *imagen* del comprobante de transferencia (foto o captura de pantalla).");
-          }
-          return;
-        }
-
-        const textoCliente = texto.trim();
-        await manejarMensaje(numeroTelefono, textoCliente, responder, enviarDatosBancarios, notificarStaff);
+        await manejarMensajeEntrante({
+          numeroTelefono,
+          texto,
+          imagen,
+          responder,
+          enviarDatosBancarios,
+          notificarStaff,
+        });
       })();
     }
   });

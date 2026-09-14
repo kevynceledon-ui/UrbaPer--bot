@@ -22,3 +22,19 @@ services:
         sync: false
       - key: DIRECCION_LOCAL
         sync: false
+      # === WhatsApp Cloud API (migración desde Baileys) ===
+      # Se queda en "baileys" hasta completar la validación contra el número de
+      # prueba (Fase C del plan de migración) — cambiar a "cloud" recién en la
+      # Fase D, junto con los valores reales de abajo.
+      - key: WHATSAPP_TRANSPORT
+        value: baileys
+      - key: WHATSAPP_ACCESS_TOKEN
+        sync: false
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_APP_SECRET
+        sync: false
+      - key: WHATSAPP_VERIFY_TOKEN
+        sync: false
+      - key: WHATSAPP_TEMPLATE_AVISO_STAFF
+        sync: false
