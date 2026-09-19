@@ -107,6 +107,11 @@ class Producto extends Model<InferAttributes<Producto>, InferCreationAttributes<
   //calcularTiempoPedido() en whatsappServices.ts para estimar la demora real en
   //vez de una fórmula genérica por cantidad de pedidos en cola.
   declare tiempoPreparacionMin: CreationOptional<number>;
+  //Content ID del producto en el catálogo de Meta Commerce Manager (el mismo
+  //"product_retailer_id" que llega en el webhook cuando un cliente arma su
+  //carrito nativo de WhatsApp). Puente entre lo que el cliente eligió en
+  //WhatsApp y la fila de Producto acá — ver plan de migración a catálogo.
+  declare retailerId: string | null;
 }
 
 Producto.init(
@@ -142,6 +147,12 @@ Producto.init(
       type: DataTypes.INTEGER,
       allowNull: false,
       defaultValue: 15,
+    },
+    retailerId: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      unique: true,
+      defaultValue: null,
     },
   },
   { sequelize, modelName: "Producto" }
