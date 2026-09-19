@@ -16,9 +16,13 @@ function formatEspera(desde: string): string {
 }
 
 export function ClienteEsperandoCard({ cliente, onDevolver }: { cliente: ClienteEsperando; onDevolver: (telefono: string) => void }) {
-  const tel = numeroLimpio(cliente.telefono)
+  // Guarda contra un registro con teléfono/nombre faltante — el tipo lo marca
+  // como obligatorio, pero eso no protege contra un dato real que llegue roto
+  // (ver el mismo problema y su Error Boundary en OrderCard.tsx/main.tsx).
+  const tel = numeroLimpio(cliente.telefono ?? '')
   const telIntl = tel.startsWith('56') ? tel : `56${tel}`
   const waUrl = `https://wa.me/${telIntl}`
+  const nombreCliente = cliente.nombre ?? 'Cliente'
 
   return (
     <article className="flex flex-col gap-3 rounded-2xl border border-brand-400/30 bg-zinc-900 p-3.5">
@@ -27,7 +31,7 @@ export function ClienteEsperandoCard({ cliente, onDevolver }: { cliente: Cliente
           <HandHelping className="h-5 w-5" />
         </span>
         <div className="min-w-0 flex-1">
-          <h4 className="truncate text-sm font-extrabold text-white">{cliente.nombre}</h4>
+          <h4 className="truncate text-sm font-extrabold text-white">{nombreCliente}</h4>
           <p className="truncate text-xs font-medium text-zinc-500">Pidió ayuda humana · {formatEspera(cliente.desde)}</p>
         </div>
       </div>
@@ -37,7 +41,7 @@ export function ClienteEsperandoCard({ cliente, onDevolver }: { cliente: Cliente
           target="_blank"
           rel="noopener noreferrer"
           className="flex flex-1 items-center justify-center gap-1.5 rounded-full bg-[#25D366] px-3 py-2 text-xs font-bold text-white shadow-sm transition active:scale-[0.98]"
-          aria-label={`Abrir WhatsApp con ${cliente.nombre}`}
+          aria-label={`Abrir WhatsApp con ${nombreCliente}`}
         >
           <MessageCircle className="h-3.5 w-3.5" />
           WhatsApp
@@ -45,7 +49,7 @@ export function ClienteEsperandoCard({ cliente, onDevolver }: { cliente: Cliente
         <button
           onClick={() => onDevolver(cliente.telefono)}
           className="flex flex-1 items-center justify-center gap-1.5 rounded-full bg-zinc-800 px-3 py-2 text-xs font-bold text-zinc-300 transition hover:bg-zinc-700 hover:text-white"
-          aria-label={`Devolver al bot a ${cliente.nombre}`}
+          aria-label={`Devolver al bot a ${nombreCliente}`}
         >
           <CheckCircle2 className="h-3.5 w-3.5" />
           Devolver al bot

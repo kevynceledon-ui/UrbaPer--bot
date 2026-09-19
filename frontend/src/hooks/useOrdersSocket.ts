@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import type { Socket } from 'socket.io-client'
 import type { Order } from '../types/order'
 import { getSocket, disconnectSocket } from '../services/socket'
@@ -9,6 +9,12 @@ export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
   const [orders, setOrders] = useState<Order[]>([])
   const [connectionState, setConnectionState] = useState<'connecting' | 'connected' | 'disconnected' | 'error'>('disconnected')
   const [lastOrder, setLastOrder] = useState<Order | null>(null)
+  // IDs que se sacaron de la lista de forma optimista (botón "Listo"/"No
+  // llegó"/"Cancelar") pero cuyo PATCH todavía no confirma en el backend. El
+  // poll de 60s (más abajo) los ignora mientras estén acá — si no, un GET que
+  // ya estaba en vuelo cuando se tocó el botón podía volver a agregar el
+  // pedido que el staff recién sacó, porque en la BD todavía figuraba activo.
+  const pendingRemovals = useRef<Set<string>>(new Set())
 
   const addOrder = useCallback((order: Order) => {
     setOrders((prev) => [order, ...prev])
@@ -46,11 +52,20 @@ export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
       console.log('[Socket] nuevo_pedido', payload)
       addOrder(payload)
     }
+    // Otro dashboard (u otra pestaña) marcó un pedido como entregado/cancelado
+    // vía PATCH — sin escuchar esto, este dashboard solo se enteraba al
+    // siguiente poll de 60s o al recargar la página.
+    const onPedidoActualizado = (payload: { id: string; estado: string }) => {
+      if (payload.estado === 'entregado' || payload.estado === 'cancelado') {
+        setOrders((prev) => prev.filter((o) => String(o.id) !== String(payload.id)))
+      }
+    }
 
     socket.on('connect', onConnect)
     socket.on('disconnect', onDisconnect)
     socket.on('connect_error', onConnectError)
     socket.on('nuevo_pedido', onNuevoPedido)
+    socket.on('pedido_actualizado', onPedidoActualizado)
 
     // Si ya estaba conectado antes de añadir listeners, reflejar
     if (socket.connected) setConnectionState('connected')
@@ -60,6 +75,7 @@ export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
       socket.off('disconnect', onDisconnect)
       socket.off('connect_error', onConnectError)
       socket.off('nuevo_pedido', onNuevoPedido)
+      socket.off('pedido_actualizado', onPedidoActualizado)
       // No desconectar aquí inmediatamente si queremos reconexión entre rutas
       // Pero el hook del Dashboard sí debe limpiar al desmontar si se quiere.
     }
@@ -81,7 +97,9 @@ export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
           if (cancelado) return
           setOrders((prev) => {
             const idsExistentes = new Set(prev.map((o) => String(o.id)))
-            const nuevos = pedidos.filter((p) => !idsExistentes.has(String(p.id)))
+            const nuevos = pedidos.filter(
+              (p) => !idsExistentes.has(String(p.id)) && !pendingRemovals.current.has(String(p.id))
+            )
             return nuevos.length > 0 ? [...prev, ...nuevos] : prev
           })
         })
@@ -94,29 +112,47 @@ export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
 
   const clearOrders = useCallback(() => setOrders([]), [])
   const removeOrder = useCallback((id: string | number) => {
-    setOrders((prev) => prev.filter(o => String(o.id) !== String(id)))
+    const idStr = String(id)
+    pendingRemovals.current.add(idStr)
+    setOrders((prev) => prev.filter(o => String(o.id) !== idStr))
     // Persiste en BD; si falla, el pedido reaparecerá en el próximo GET /api/pedidos
     // (mejor eso que perder de vista un pedido real por un error de red puntual).
     if (token) {
-      marcarPedidoEntregado(id, token).catch((e) => console.warn('[Pedidos] No se pudo marcar como entregado:', e))
+      marcarPedidoEntregado(id, token)
+        .catch((e) => console.warn('[Pedidos] No se pudo marcar como entregado:', e))
+        .finally(() => pendingRemovals.current.delete(idStr))
+    } else {
+      pendingRemovals.current.delete(idStr)
     }
   }, [token])
 
   // Mismo patrón optimista que removeOrder, pero marca "cancelado" en vez de
   // "entregado" — usado por el botón "❌ No llegó" para el historial de no-shows.
   const marcarNoLlego = useCallback((id: string | number) => {
-    setOrders((prev) => prev.filter(o => String(o.id) !== String(id)))
+    const idStr = String(id)
+    pendingRemovals.current.add(idStr)
+    setOrders((prev) => prev.filter(o => String(o.id) !== idStr))
     if (token) {
-      marcarPedidoNoLlego(id, token).catch((e) => console.warn('[Pedidos] No se pudo marcar como no llegó:', e))
+      marcarPedidoNoLlego(id, token)
+        .catch((e) => console.warn('[Pedidos] No se pudo marcar como no llegó:', e))
+        .finally(() => pendingRemovals.current.delete(idStr))
+    } else {
+      pendingRemovals.current.delete(idStr)
     }
   }, [token])
 
   // Cliente pidió cancelar mientras el pedido ya estaba en curso (distinto del
   // caso de "No llegó": acá el equipo se entera antes de que llegue a buscarlo).
   const cancelarPedido = useCallback((id: string | number) => {
-    setOrders((prev) => prev.filter(o => String(o.id) !== String(id)))
+    const idStr = String(id)
+    pendingRemovals.current.add(idStr)
+    setOrders((prev) => prev.filter(o => String(o.id) !== idStr))
     if (token) {
-      marcarPedidoCancelado(id, token).catch((e) => console.warn('[Pedidos] No se pudo cancelar el pedido:', e))
+      marcarPedidoCancelado(id, token)
+        .catch((e) => console.warn('[Pedidos] No se pudo cancelar el pedido:', e))
+        .finally(() => pendingRemovals.current.delete(idStr))
+    } else {
+      pendingRemovals.current.delete(idStr)
     }
   }, [token])
 

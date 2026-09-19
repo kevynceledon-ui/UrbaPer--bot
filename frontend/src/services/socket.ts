@@ -38,7 +38,13 @@ export function getSocket(token: string): Socket {
   if (socket) return socket
 
   socket = io(API_URL, {
-    auth: { token: `Bearer ${token}` },
+    // Función, no un objeto literal: Socket.IO la vuelve a llamar en CADA
+    // intento de reconexión (reconnectionAttempts: Infinity, abajo). Con un
+    // objeto literal fijo, el token quedaba "congelado" en el valor que tenía
+    // al abrir la pestaña — si expiraba y la conexión se cortaba (wifi
+    // inestable, backend redeploy), reintentaba para siempre con el token
+    // viejo y nunca más lograba reconectar, sin ningún aviso.
+    auth: (cb) => cb({ token: `Bearer ${localStorage.getItem('token') ?? token}` }),
     transports: ['websocket', 'polling'],
     reconnection: true,
     reconnectionAttempts: Infinity,

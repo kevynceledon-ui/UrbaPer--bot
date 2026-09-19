@@ -64,16 +64,22 @@ type Props = {
 }
 
 export function OrderCard({ order, isNew, onDismiss, onNoLlego, onCancelar }: Props) {
-  const tel = numeroLimpio(order.cliente.telefono)
+  // Guarda contra un pedido con `cliente`/`items` faltante (registro viejo,
+  // fila a medio escribir) — sin esto, React explotaba acá y sin un Error
+  // Boundary arriba (ver main.tsx) tumbaba el dashboard ENTERO, no solo esta
+  // tarjeta, y como el pedido se vuelve a pedir al recargar, quedaba en loop.
+  const tel = numeroLimpio(order.cliente?.telefono ?? '')
   const telIntl = tel.startsWith('56') ? tel : `56${tel}`
-  const waUrl = `https://wa.me/${telIntl}?text=${encodeURIComponent(`Hola ${order.cliente.nombre}, tu pedido #${order.id} está en preparación 🍗`)}`
+  const nombreCliente = order.cliente?.nombre ?? 'Cliente'
+  const items = order.items ?? []
+  const waUrl = `https://wa.me/${telIntl}?text=${encodeURIComponent(`Hola ${nombreCliente}, tu pedido #${order.id} está en preparación 🍗`)}`
 
   return (
     <article
       className={`animate-slide-in relative flex flex-col gap-4 rounded-[20px] border bg-zinc-900 p-4 shadow-lg shadow-black/20 transition-colors
         ${isNew ? 'border-brand-400/50 ring-1 ring-brand-400/20' : 'border-zinc-800'}
       `}
-      aria-label={`Pedido ${order.id} de ${order.cliente.nombre}`}
+      aria-label={`Pedido ${order.id} de ${nombreCliente}`}
     >
       {isNew && (
         <span className="absolute -right-2 -top-2 rounded-full bg-brand-500 px-2.5 py-1 text-[11px] font-black tracking-widest text-zinc-900 shadow-md">
@@ -96,7 +102,7 @@ export function OrderCard({ order, isNew, onDismiss, onNoLlego, onCancelar }: Pr
             <span className="rounded-full bg-zinc-800 px-2 py-0.5 text-[11px] font-bold tracking-wide text-zinc-400">#{String(order.id).slice(0, 8)}</span>
             <span className="text-xs font-medium text-zinc-500">{formatHora(order.fecha)} · {formatFechaLarga(order.fecha)}</span>
           </div>
-          <h3 className="mt-1.5 truncate text-[19px] font-extrabold leading-tight text-white">{order.cliente.nombre}</h3>
+          <h3 className="mt-1.5 truncate text-[19px] font-extrabold leading-tight text-white">{nombreCliente}</h3>
           <a href={`tel:+${telIntl}`} className="text-sm font-medium text-zinc-400 underline decoration-zinc-700 decoration-2 underline-offset-4 hover:text-zinc-200">
             +{telIntl}
           </a>
@@ -161,7 +167,7 @@ export function OrderCard({ order, isNew, onDismiss, onNoLlego, onCancelar }: Pr
       <div className="rounded-2xl border border-zinc-800/80 bg-zinc-950 p-3">
         <p className="mb-2 text-[11px] font-bold tracking-widest text-zinc-500 uppercase">Detalle</p>
         <ul className="space-y-1.5">
-          {order.items.map((it, i) => (
+          {items.map((it, i) => (
             <li key={i} className="flex justify-between gap-2 text-sm">
               <span className="truncate pr-2 font-medium text-zinc-200">
                 <span className="mr-1.5 font-mono text-xs text-zinc-500">{it.cantidad ? `${it.cantidad}x` : '1x'}</span>
@@ -225,7 +231,7 @@ export function OrderCard({ order, isNew, onDismiss, onNoLlego, onCancelar }: Pr
           target="_blank"
           rel="noopener noreferrer"
           className="flex flex-1 items-center justify-center gap-2 rounded-2xl bg-[#25D366] px-3 py-2.5 text-sm font-bold text-white shadow-sm transition active:scale-[0.98]"
-          aria-label={`Contactar por WhatsApp a ${order.cliente.nombre}`}
+          aria-label={`Contactar por WhatsApp a ${nombreCliente}`}
         >
           <MessageCircle className="h-4 w-4" />
           WhatsApp

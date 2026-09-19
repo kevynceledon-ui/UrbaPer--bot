@@ -24,6 +24,28 @@ function resolveApiUrl(): string {
 }
 const API_URL = resolveApiUrl()
 
+// El token JWT expira (JWT_EXPIRES_IN, hoy 12h) pero nada en el dashboard lo
+// revisaba después del chequeo inicial al montar — cada request posterior que
+// devolvía 401 solo se logueaba en consola y ahí quedaba, dejando el
+// dashboard "pegado" sin avisar a mitad de turno. `apiFetch` centraliza el
+// manejo: cualquier 401 limpia la sesión y manda a /login. `login()` NO usa
+// este wrapper — un 401 ahí es "credenciales incorrectas", no "sesión vencida".
+function handleUnauthorized() {
+  localStorage.removeItem('token')
+  localStorage.removeItem('user')
+  if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+    window.location.href = '/login'
+  }
+}
+
+async function apiFetch(url: string, options?: RequestInit): Promise<Response> {
+  const res = await fetch(url, options)
+  if (res.status === 401) {
+    handleUnauthorized()
+  }
+  return res
+}
+
 export interface LoginResponse {
   ok: boolean
   token: string
@@ -46,7 +68,7 @@ export async function login(user: string, password: string): Promise<LoginRespon
 
 export async function verifyToken(token: string): Promise<boolean> {
   try {
-    const res = await fetch(`${API_URL}/api/verify`, {
+    const res = await apiFetch(`${API_URL}/api/verify`, {
       headers: { Authorization: `Bearer ${token}` },
     })
     const data = await res.json()
@@ -64,7 +86,7 @@ export function getApiUrl(): string {
 //lo que haya quedado pendiente cuando el Dashboard recarga (ej. el celular descarga
 //la pestaña en segundo plano) en vez de depender solo del evento en vivo del socket.
 export async function getPedidosActivos(token: string): Promise<import('../types/order').Order[]> {
-  const res = await fetch(`${API_URL}/api/pedidos`, {
+  const res = await apiFetch(`${API_URL}/api/pedidos`, {
     headers: { Authorization: `Bearer ${token}` },
   })
   const data = await res.json()
@@ -77,7 +99,7 @@ export async function getPedidosActivos(token: string): Promise<import('../types
 //Pedidos agendados fuera de horario (ver ADR-002) cuya hora todavía no llega —
 //sección separada del dashboard, no se mezclan con los pedidos activos de ahora.
 export async function getPedidosProgramados(token: string): Promise<import('../types/order').Order[]> {
-  const res = await fetch(`${API_URL}/api/pedidos/programados`, {
+  const res = await apiFetch(`${API_URL}/api/pedidos/programados`, {
     headers: { Authorization: `Bearer ${token}` },
   })
   const data = await res.json()
@@ -90,7 +112,7 @@ export async function getPedidosProgramados(token: string): Promise<import('../t
 export type EstadoPedido = 'comprando' | 'pendiente' | 'preparando' | 'listo' | 'entregado' | 'cancelado'
 
 export async function actualizarEstadoPedido(id: string | number, estado: EstadoPedido, token: string): Promise<void> {
-  const res = await fetch(`${API_URL}/api/pedidos/${id}`, {
+  const res = await apiFetch(`${API_URL}/api/pedidos/${id}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({ estado }),
@@ -118,7 +140,7 @@ export function marcarPedidoCancelado(id: string | number, token: string): Promi
 
 //Clientes que pidieron hablar con una persona y el bot todavía tiene pausado.
 export async function getClientesEsperando(token: string): Promise<import('../types/order').ClienteEsperando[]> {
-  const res = await fetch(`${API_URL}/api/clientes/necesitan-humano`, {
+  const res = await apiFetch(`${API_URL}/api/clientes/necesitan-humano`, {
     headers: { Authorization: `Bearer ${token}` },
   })
   const data = await res.json()
@@ -129,7 +151,7 @@ export async function getClientesEsperando(token: string): Promise<import('../ty
 }
 
 export async function reanudarBot(telefono: string, token: string): Promise<void> {
-  const res = await fetch(`${API_URL}/api/clientes/${telefono}/reanudar-bot`, {
+  const res = await apiFetch(`${API_URL}/api/clientes/${telefono}/reanudar-bot`, {
     method: 'PATCH',
     headers: { Authorization: `Bearer ${token}` },
   })
@@ -143,7 +165,7 @@ export async function reanudarBot(telefono: string, token: string): Promise<void
 //"Reiniciar vínculo" para cuando el bot queda en un estado raro sin esperar
 //a un redeploy).
 export async function reiniciarWhatsapp(token: string): Promise<void> {
-  const res = await fetch(`${API_URL}/api/whatsapp/reiniciar`, {
+  const res = await apiFetch(`${API_URL}/api/whatsapp/reiniciar`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
   })
@@ -178,7 +200,7 @@ function mapearConfiguracion(data: any): ConfiguracionBot {
 
 //Botón de pausa/emergencia: corta las respuestas automáticas del bot.
 export async function getConfiguracion(token: string): Promise<ConfiguracionBot> {
-  const res = await fetch(`${API_URL}/api/configuracion`, {
+  const res = await apiFetch(`${API_URL}/api/configuracion`, {
     headers: { Authorization: `Bearer ${token}` },
   })
   const data = await res.json()
@@ -192,7 +214,7 @@ export async function actualizarConfiguracion(
   token: string,
   cambios: Partial<ConfiguracionBot>
 ): Promise<ConfiguracionBot> {
-  const res = await fetch(`${API_URL}/api/configuracion`, {
+  const res = await apiFetch(`${API_URL}/api/configuracion`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify(cambios),

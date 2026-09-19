@@ -14,6 +14,7 @@ import {
 import { Header } from '../components/Header'
 import { OrderCard } from '../components/OrderCard'
 import { ClienteEsperandoCard } from '../components/ClienteEsperandoCard'
+import { ErrorBoundary } from '../components/ErrorBoundary'
 import { StartShiftButton } from '../components/StartShiftButton'
 import { useWakeLock } from '../hooks/useWakeLock'
 import { useAudioUnlock } from '../hooks/useAudioUnlock'
@@ -289,7 +290,9 @@ export function DashboardPage() {
               Esperando atención · {clientesEsperando.length}
             </h2>
             {clientesEsperando.map((c) => (
-              <ClienteEsperandoCard key={c.telefono} cliente={c} onDevolver={devolverAlBot} />
+              <ErrorBoundary key={c.telefono}>
+                <ClienteEsperandoCard cliente={c} onDevolver={devolverAlBot} />
+              </ErrorBoundary>
             ))}
           </div>
         )}
@@ -388,7 +391,7 @@ export function DashboardPage() {
                     type="number"
                     min={1}
                     value={duracionFranjaMin}
-                    onChange={(e) => setDuracionFranjaMin(Number(e.target.value) || 1)}
+                    onChange={(e) => setDuracionFranjaMin(Math.max(1, Number(e.target.value) || 1))}
                     className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 focus:border-brand-400 focus:outline-none focus:ring-2 focus:ring-brand-400/20"
                   />
                 </div>
@@ -398,7 +401,7 @@ export function DashboardPage() {
                     type="number"
                     min={1}
                     value={capacidadPorFranja}
-                    onChange={(e) => setCapacidadPorFranja(Number(e.target.value) || 1)}
+                    onChange={(e) => setCapacidadPorFranja(Math.max(1, Number(e.target.value) || 1))}
                     className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 focus:border-brand-400 focus:outline-none focus:ring-2 focus:ring-brand-400/20"
                   />
                 </div>
@@ -447,7 +450,9 @@ export function DashboardPage() {
               Pedidos programados · {pedidosProgramados.length}
             </h2>
             {pedidosProgramados.map((o) => (
-              <OrderCard key={String(o.id)} order={o} onCancelar={handleCancelarProgramado} />
+              <ErrorBoundary key={String(o.id)}>
+                <OrderCard order={o} onCancelar={handleCancelarProgramado} />
+              </ErrorBoundary>
             ))}
           </div>
         )}
@@ -481,7 +486,9 @@ export function DashboardPage() {
         ) : (
           <div className="space-y-3" aria-live="polite" aria-relevant="additions">
             {orders.map(o => (
-              <OrderCard key={String(o.id)} order={o} isNew={String(o.id) === String(highlightId)} onDismiss={removeOrder} onNoLlego={marcarNoLlego} onCancelar={handleCancelarActivo} />
+              <ErrorBoundary key={String(o.id)}>
+                <OrderCard order={o} isNew={String(o.id) === String(highlightId)} onDismiss={removeOrder} onNoLlego={marcarNoLlego} onCancelar={handleCancelarActivo} />
+              </ErrorBoundary>
             ))}
           </div>
         )}

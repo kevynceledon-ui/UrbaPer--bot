@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Socket } from 'socket.io-client'
 import type { Order } from '../types/order'
 import { getSocket } from '../services/socket'
@@ -9,12 +9,16 @@ import { getPedidosProgramados, marcarPedidoCancelado } from '../services/api'
 //feed de pedidos activos de ahora (ver useOrdersSocket / evento "nuevo_pedido").
 export function usePedidosProgramados(token: string | null) {
   const [pedidos, setPedidos] = useState<Order[]>([])
+  // Marca de tiempo del último pedido agregado por socket, para que el poll de
+  // abajo sepa si su respuesta quedó "vieja" mientras estaba en vuelo.
+  const ultimoEventoSocketEn = useRef(0)
 
   useEffect(() => {
     if (!token) return
     const socket: Socket = getSocket(token)
 
     const onNuevoProgramado = (payload: Order) => {
+      ultimoEventoSocketEn.current = Date.now()
       setPedidos((prev) => [...prev.filter((p) => p.id !== payload.id), payload])
     }
 
@@ -34,9 +38,16 @@ export function usePedidosProgramados(token: string | null) {
     if (!token) return
     let cancelado = false
     const cargar = () => {
+      // Si llega un pedido nuevo por socket mientras este GET está en vuelo, la
+      // respuesta del servidor (calculada con datos de ANTES de ese pedido) lo
+      // pisaba al reemplazar toda la lista — desaparecía de la pantalla hasta
+      // el siguiente ciclo de 60s. Se descarta esa respuesta puntual en vez de
+      // aplicarla; el próximo poll ya vendrá con datos consistentes.
+      const pedidoAntesDe = Date.now()
       getPedidosProgramados(token)
         .then((pedidos) => {
           if (cancelado) return
+          if (ultimoEventoSocketEn.current > pedidoAntesDe) return
           setPedidos(pedidos)
         })
         .catch((e) => console.warn('[Pedidos] No se pudieron cargar los pedidos programados:', e))
