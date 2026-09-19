@@ -15,6 +15,15 @@ import whatsappWebhookRoutes from "./routes/whatsappWebhook.js";
 import configuracionRoutes from "./routes/configuracion.js";
 import { iniciarWhatsapp } from "./services/whatsappServices.js";
 
+// Red de seguridad: cualquier promesa rechazada sin `.catch` en algún punto
+// del código (ej. el handler de mensajes de Baileys) mataría el proceso
+// completo por defecto desde Node 15 — tumbando el bot para todos los
+// clientes por un error de uno solo. Esto no reemplaza atrapar errores donde
+// corresponde, solo evita que un olvido puntual se lleve todo el servidor.
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection] Promesa rechazada sin atrapar:", reason);
+});
+
 // Variables obligatorias en producción: sin ellas el server no debe arrancar
 // con fallbacks inseguros conocidos (ver src/routes/auth.ts).
 if (process.env.NODE_ENV === "production") {
@@ -32,8 +41,12 @@ const PORT = Number(process.env.PORT) || 3000;
 // Render (y Cloudflare delante) proxean las peticiones agregando X-Forwarded-For.
 // Sin esto, express-rate-limit rechaza esa cabecera como sospechosa en cada request
 // (podría ser IP spoofing de un cliente directo) y tira ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
-// "1" = confía en un solo salto de proxy (el de Render), no en cualquiera.
-app.set("trust proxy", 1);
+// "2" = confía en dos saltos de proxy (Cloudflare + Render). Con "1" (el valor
+// anterior), Express solo descontaba un salto de X-Forwarded-For y terminaba
+// resolviendo req.ip a la IP de borde de Cloudflare para TODO el tráfico — el
+// rate limiter (login incluido) trataba a todos los usuarios como una sola IP,
+// pudiendo bloquear al admin real por el tráfico de otra persona.
+app.set("trust proxy", 2);
 
 // ===================== SEGURIDAD PRODUCCIÓN =====================
 
@@ -46,12 +59,24 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
   : ["http://localhost:3000", "http://localhost:5173", "http://localhost:5500"];
 
+// "*" en ALLOWED_ORIGINS ya NO se trata como "permitir cualquier origen": con
+// credentials:true (abajo) eso reflejaba el Origin real de CUALQUIER sitio en
+// Access-Control-Allow-Origin, dejando que una página maliciosa hiciera
+// peticiones autenticadas contra esta API desde el navegador de un admin
+// logueado. Si de verdad se necesita abrir la API a cualquier origen, hay que
+// hacerlo explícitamente sin `credentials`, no colando "*" en esta lista.
+if (allowedOrigins.includes("*")) {
+  console.warn(
+    '[CORS] ALLOWED_ORIGINS incluye "*" — se ignora por seguridad (credentials:true no debe combinarse con origen comodín). Lista los orígenes exactos permitidos.'
+  );
+}
+
 app.use(
   cors({
     origin: function (origin, callback) {
       // origin === undefined -> peticiones sin origen (curl, postman, server-to-server) -> permitir
       if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin) || allowedOrigins.includes("*")) {
+      if (allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
       return callback(new Error(`CORS bloqueado para origen: ${origin}`));
@@ -106,11 +131,6 @@ app.use("/api", pedidosRoutes);
 app.use("/api", clientesRoutes);
 app.use("/api", whatsappRoutes);
 app.use("/api", configuracionRoutes);
-
-// Ejemplo de ruta protegida para el Dashboard (verifica que el JWT middleware funciona en HTTP también)
-// Descomenta si quieres probar:
-// import { authenticateToken } from "./middleware/auth.js";
-// app.get("/api/pedidos", authenticateToken, (req,res)=> res.json({ok:true, data:[]}));
 
 // ===================== SERVIDOR HTTP + SOCKET.IO =====================
 

@@ -25,10 +25,10 @@ function authenticateToken(req: AuthedRequest, res: Response, next: NextFunction
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ["HS256"] });
     req.user = decoded;
     return next();
-  } catch (err) {
+  } catch {
     return res.status(403).json({ ok: false, error: "Token inválido o expirado" });
   }
 }

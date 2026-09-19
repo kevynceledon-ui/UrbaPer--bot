@@ -28,7 +28,10 @@ function initSocket(httpServer: HttpServer): Server {
         // Permitir requests sin origin (ej. Postman, mobile, curl) solo si se desea
         // En producción estricto, puedes rechazar !origin.
         if (!origin) return callback(null, true);
-        if (allowedOrigins.includes(origin) || allowedOrigins.includes("*")) {
+        // "*" no se trata como comodín acá tampoco — mismo motivo que en el
+        // CORS de Express (src/index.ts): con credentials:true, reflejar
+        // cualquier Origin real es una puerta abierta, no una conveniencia.
+        if (allowedOrigins.includes(origin)) {
           return callback(null, true);
         }
         return callback(new Error(`CORS Socket.IO no permitido para origen: ${origin}`));
@@ -58,10 +61,10 @@ function initSocket(httpServer: HttpServer): Server {
         return next(new Error("Error interno de autenticación"));
       }
 
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ["HS256"] });
       socket.user = decoded; // { user: "admin", iat, exp }
       return next();
-    } catch (err) {
+    } catch {
       return next(new Error("No autorizado: token inválido o expirado"));
     }
   });

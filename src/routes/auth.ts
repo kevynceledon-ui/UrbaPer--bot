@@ -62,7 +62,7 @@ router.post("/login", loginLimiter, (req, res) => {
   }
 
   // 3. Firmar JWT - payload mínimo
-  const token = jwt.sign({ user: expectedUser }, jwtSecret, { expiresIn } as jwt.SignOptions);
+  const token = jwt.sign({ user: expectedUser }, jwtSecret, { expiresIn, algorithm: "HS256" } as jwt.SignOptions);
 
   return res.json({
     ok: true,

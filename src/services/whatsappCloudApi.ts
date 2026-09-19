@@ -30,7 +30,7 @@ async function graphFetch(path: string, init: RequestInit): Promise<any> {
     ...init,
     headers: {
       Authorization: `Bearer ${accessToken()}`,
-      ...(init.headers ?? {}),
+      ...init.headers,
     },
   });
   const data = await res.json().catch(() => null);

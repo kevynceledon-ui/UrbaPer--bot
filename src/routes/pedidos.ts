@@ -138,15 +138,27 @@ router.patch("/pedidos/:id", authenticateToken, async (req, res) => {
     return res.status(400).json({ ok: false, error: "Estado inválido", details: parsed.error.flatten() });
   }
 
-  const pedido = await Pedido.findByPk(String(req.params.id));
-  if (!pedido) {
-    return res.status(404).json({ ok: false, error: "Pedido no encontrado" });
+  try {
+    const pedido = await Pedido.findByPk(String(req.params.id));
+    if (!pedido) {
+      return res.status(404).json({ ok: false, error: "Pedido no encontrado" });
+    }
+
+    pedido.estado = parsed.data.estado;
+    await pedido.save();
+
+    // Sin esto, otros dashboards conectados no se enteraban del cambio de
+    // estado hasta el siguiente poll/recarga — el que hizo el PATCH lo veía
+    // reflejado al toque (ya lo sacó de su lista local), pero cualquier otro
+    // dispositivo del equipo seguía mostrando el pedido en el estado viejo.
+    const { getIO } = await import("../config/socket.js");
+    getIO().emit("pedido_actualizado", { id: pedido.id, estado: pedido.estado });
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("Error al actualizar pedido:", error);
+    return res.status(500).json({ ok: false, error: "No se pudo actualizar el pedido" });
   }
-
-  pedido.estado = parsed.data.estado;
-  await pedido.save();
-
-  return res.json({ ok: true });
 });
 
 export default router;

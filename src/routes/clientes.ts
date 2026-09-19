@@ -40,17 +40,22 @@ router.get("/clientes/necesitan-humano", authenticateToken, async (_req, res) =>
 router.patch("/clientes/:telefono/reanudar-bot", authenticateToken, async (req, res) => {
   const telefono = String(req.params.telefono);
 
-  await Cliente.update({ necesitaHumanoDesde: null }, { where: { telefono } });
-  reanudarBot(telefono);
-
   try {
-    const { getIO } = await import("../config/socket.js");
-    getIO().emit("cliente_bot_reanudado", { telefono });
-  } catch (e) {
-    console.warn("[Socket.IO] No se pudo emitir cliente_bot_reanudado:", e instanceof Error ? e.message : e);
-  }
+    await Cliente.update({ necesitaHumanoDesde: null }, { where: { telefono } });
+    reanudarBot(telefono);
 
-  return res.json({ ok: true });
+    try {
+      const { getIO } = await import("../config/socket.js");
+      getIO().emit("cliente_bot_reanudado", { telefono });
+    } catch (e) {
+      console.warn("[Socket.IO] No se pudo emitir cliente_bot_reanudado:", e instanceof Error ? e.message : e);
+    }
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("Error al reanudar el bot para un cliente:", error);
+    return res.status(500).json({ ok: false, error: "No se pudo reanudar el bot" });
+  }
 });
 
 export default router;
