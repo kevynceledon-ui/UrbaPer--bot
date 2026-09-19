@@ -25,22 +25,23 @@ No es un proyecto de práctica — está corriendo en producción, tomando pedid
 
 | Capa | Tecnología | Por qué |
 |---|---|---|
-| WhatsApp | [Baileys](https://github.com/WhiskeySockets/Baileys) (`@whiskeysockets/baileys`) | Conexión vía protocolo de WhatsApp Web — sin costo, viable para el volumen de un negocio pequeño. Es una librería **no oficial**, decisión consciente frente a la Cloud API de Meta (ver más abajo). |
+| WhatsApp | [Baileys](https://github.com/WhiskeySockets/Baileys) (`@whiskeysockets/baileys`) **en migración hacia la [WhatsApp Business Platform Cloud API](https://developers.facebook.com/docs/whatsapp/cloud-api)**, la API oficial de Meta | El número real sigue en Baileys hoy, pero el transporte de Cloud API ya está construido y desplegado (detrás de una bandera, sin activar todavía). Motivo del cambio: Baileys no tiene respaldo oficial de Meta y expone el número real a un baneo sin aviso — riesgo que crece justo cuando el negocio tiene más pedidos. Ver "Decisiones de diseño" y el Roadmap. |
 | Backend | Node.js + TypeScript + Express | Tipado en toda la lógica de negocio, que tiene bastante ramificación (modalidad, horarios, verificación de pago). |
 | Base de datos | PostgreSQL + Sequelize | Modelo relacional para pedidos, productos, categorías, horarios de atención y configuración del bot. |
 | Tiempo real | Socket.IO | Dashboard se actualiza al instante con cada pedido nuevo, sin polling. |
 | Seguridad | Helmet, JWT, `express-rate-limit`, CORS configurado | Dashboard autenticado, no expuesto públicamente sin login. |
 | Frontend (dashboard) | Desplegado en Vercel | Separado del backend, consume la API vía Socket.IO + REST. |
-| Hosting | Render | Con disco persistente para la sesión de WhatsApp (crítico: sin esto, cada redeploy pediría re-escanear el QR). |
+| Hosting | Render | La sesión de Baileys (`.baileys_auth`) vive en el filesystem del contenedor, no en un disco persistente — sobrevive a reinicios del proceso, pero no está garantizado que sobreviva a un redeploy. Es otra razón para migrar a la Cloud API: ahí la sesión la administra Meta, no depende de infraestructura de disco. |
 
 ## 📐 Decisiones de diseño destacadas
 
 Este proyecto tiene bastante más lógica de negocio real de la que un bot de menú típico necesita. Algunas decisiones que vale la pena mencionar:
 
-- **Baileys vs. Cloud API oficial de Meta:** se evaluó explícitamente el trade-off. Baileys no tiene respaldo oficial y requiere cuidado (número dedicado, IP estable, evitar patrones de spam), pero elimina el costo de la Cloud API para un negocio de este tamaño. Documentado como decisión consciente, no un descuido.
+- **Baileys → Cloud API oficial de Meta, migración en curso.** Baileys fue la elección inicial (sin costo, viable para el volumen de un negocio pequeño), pero no tiene respaldo oficial de Meta y expone el número real a un baneo sin aviso previo — un riesgo que crece justo cuando el negocio tiene más pedidos, que es cuando más dolería perder el canal. Se investigó el costo real de la Cloud API contra la documentación oficial y se decidió migrar: el transporte ya está construido y validado contra un número de prueba, desplegado en producción detrás de una bandera (`WHATSAPP_TRANSPORT`), sin activar todavía sobre el número real hasta completar la validación final.
 - **Fórmula de demora no es un número fijo por pedido.** Se calculó combinando el plato más lento del pedido más un factor de paralelización sobre el resto — evita tanto subestimar (varios platos "gratis") como sobrestimar (sumar tiempos como si se cocinaran en serie).
+- **Máquina de estados explícita, con un único objeto de estado por cliente.** La conversación es una tabla `estado → manejador` (un manejador por paso: nombre, modalidad, método de pago, comprobante, confirmación…) y todo lo que el bot recuerda de un pedido a medio armar vive en una sola estructura por cliente que se borra de una vez. Antes eran ~10 mapas sueltos y una función de 700 líneas; esa forma producía bugs reales (datos de pago mezclados entre intentos, un `reset` que dejaba el carrito anterior colgado). La refactorización se validó con una comparación "golden master": las mismas conversaciones simuladas contra el código viejo y el nuevo, respuesta por respuesta, sin diferencias.
 - **Agenda de horarios como menú cerrado, no texto libre.** El cliente nunca escribe una hora a mano — elige entre franjas ya validadas contra la capacidad real, eliminando por diseño el caso de "pedí una hora que ya estaba llena".
-- **Separación estricta entre "vitrina" y "canal de compra"** respecto al catálogo nativo de WhatsApp Business: se evaluó integrar el catálogo como canal de pedido directo (`orderMessage` + `getOrderDetails`, protocolo no documentado de Baileys) y se decidió postergarlo — ver Roadmap.
+- **Catálogo nativo de WhatsApp Business como canal de compra real, no solo vitrina.** La integración inicial evaluada contra Baileys (`orderMessage`/`getOrderDetails`, protocolo no documentado y frágil) se descartó a propósito. Con la migración a la Cloud API, el catálogo se arma en Meta Commerce Manager (herramienta oficial de Meta) y el pedido armado ahí llega al bot como un evento de webhook normal — mismo motor de conversación que ya procesa los pedidos por código de texto, sin duplicar lógica de pago/entrega. Ver Roadmap.
 
 ## 🗂️ Modelo de datos
 
@@ -72,6 +73,7 @@ erDiagram
         uuid categoriaId FK "nullable: productos históricos sin categoría"
         int orden
         int tiempoPreparacionMin "usado en el cálculo de demora"
+        string retailerId UK "id del producto en el catálogo de Meta (carrito nativo)"
     }
 
     PEDIDO {
@@ -141,12 +143,14 @@ Al iniciar por primera vez, Baileys genera un código QR en consola para vincula
 
 ## 🗺️ Roadmap
 
-Documentado y diseñado, pendiente de implementación:
+**En curso** — migración de Baileys a la WhatsApp Business Platform Cloud API:
+- Transporte Cloud API construido y validado contra un número de prueba (texto, imagen de comprobante, persistencia en base de datos).
+- Catálogo nativo de WhatsApp Business (vía Meta Commerce Manager) como canal de compra real: el cliente arma su carrito en la interfaz nativa de WhatsApp, el bot recibe el pedido armado por webhook y sigue el mismo flujo de pago/entrega que ya existe.
+- Corte del número real: pendiente de verificación de negocio ante Meta y de un período de validación en paralelo con Baileys antes de desactivarlo.
 
-- Sincronización del catálogo real de WhatsApp Business (`getCatalog()`) como fuente del menú, evitando carga manual duplicada.
+**Documentado, pendiente de implementación:**
 - Comando `/agotado` para que el dueño marque un plato sin stock en el momento, sin depender de predicciones de demanda.
 - Verificación automática de comprobantes de transferencia con un modelo de visión (detección de comprobantes reciclados, montos incorrectos), como filtro previo a revisión humana, no como reemplazo de esta.
-- Evaluación futura de soporte para pedidos hechos directamente desde el catálogo nativo de WhatsApp (actualmente el catálogo, si se activa, funciona solo como vitrina).
 
 ## 👤 Sobre el desarrollo de este proyecto
 
