@@ -13,8 +13,25 @@ import path from "node:path";
 import { Op } from "sequelize";
 import { estaAbierto as estaAbiertoSegunHorario, calcularFranjasDisponibles, horaChileAFecha, formatHoraChile } from "../utils/horario.js";
 
-//Memoria temporal.
-const estadosUsuarios: Record<string, string> = {};
+//Estado en memoria de cada cliente, indexado por teléfono. Vive acá y no en la
+//BD a propósito: un pedido a medio armar no vale la pena persistirlo, y recién
+//se guarda en Postgres al confirmar (ver manejarConfirmandoPedido). Se pierde
+//si el proceso se reinicia a mitad de una conversación.
+type EstadoConversacion =
+  | "ESPERANDO_NOMBRE"
+  | "ESPERANDO_CONFIRMAR_AGENDA"
+  | "ELIGIENDO_CATEGORIA"
+  | "REALIZANDO_PEDIDO"
+  | "PIDIENDO_MODALIDAD"
+  | "ELIGIENDO_HORA_PROGRAMADA"
+  | "PIDIENDO_METODO_PAGO"
+  | "PIDIENDO_MONTO_EFECTIVO"
+  | "ESPERANDO_COMPROBANTE"
+  | "PIDIENDO_DIRECCION"
+  | "PIDIENDO_NOTA"
+  | "CONFIRMANDO_PEDIDO"
+  | "PROCESANDO_PEDIDO"
+  | "HABLANDO_CON_HUMANO";
 
 interface CarritoItem {
   productoId: string;
@@ -24,33 +41,80 @@ interface CarritoItem {
   //vez de una fórmula genérica por cantidad de pedidos en cola.
   tiempoPreparacionMin: number;
 }
-const carritos: Record<string, CarritoItem[]> = {};
-//Último listado de códigos mostrado a cada cliente (categoría elegida o "ver todo
-//el menú"), mapeando el número que escribe (1, 2, 3…) al producto real. Se
-//sobreescribe cada vez que se muestra un listado nuevo (ver ELIGIENDO_CATEGORIA).
-const menuActualPendiente: Record<string, Record<string, CarritoItem>> = {};
-//Pedidos agendados fuera de horario (ver ADR-002): si el cliente aceptó agendar,
-//se le pregunta la hora después de la modalidad en vez de ir directo al pago.
-//`franjasPendientes` cachea el listado exacto mostrado, para que elegir "3"
-//siempre mapee al mismo horario aunque la disponibilidad cambie mientras responde.
-const pedidosProgramadosPendientes: Record<string, boolean> = {};
-const franjasPendientes: Record<string, { inicio: string; fin: string }[]> = {};
-const horaProgramadaPendientes: Record<string, Date> = {};
-//Nota de alergias/instrucciones especiales pendiente de confirmar (ver estado
-//PIDIENDO_NOTA / CONFIRMANDO_PEDIDO).
-const notasPendientes: Record<string, string> = {};
-//Método de pago elegido (ver estado PIDIENDO_METODO_PAGO) y comprobante de
-//transferencia recibido (ver estado ESPERANDO_COMPROBANTE), ambos pendientes
-//hasta la confirmación final.
-const metodosPagoPendientes: Record<string, "efectivo" | "transferencia"> = {};
-const comprobantesPendientes: Record<string, string> = {};
-//Modalidad de entrega (ver estado PIDIENDO_MODALIDAD), dirección de despacho (solo
-//si delivery, ver PIDIENDO_DIRECCION) y monto con el que paga en efectivo (para
-//calcular el vuelto, ver PIDIENDO_MONTO_EFECTIVO), todos pendientes hasta la
-//confirmación final.
-const modalidadesPendientes: Record<string, "delivery" | "retiro"> = {};
-const direccionesPendientes: Record<string, string> = {};
-const montosRecibidosPendientes: Record<string, number> = {};
+
+interface PedidoPendiente {
+  //Paso de la conversación en el que está el cliente (ausente = sin pedido activo).
+  estado?: EstadoConversacion;
+  carrito?: CarritoItem[];
+  //Último listado de códigos mostrado (categoría elegida o "ver todo el menú"),
+  //mapeando el número que escribe (1, 2, 3…) al producto real. Se sobreescribe
+  //cada vez que se muestra un listado nuevo (ver manejarEligiendoCategoria).
+  menuActual?: Record<string, CarritoItem>;
+  //Pedido agendado fuera de horario (ver ADR-002): si el cliente aceptó agendar,
+  //se le pregunta la hora después de la modalidad en vez de ir directo al pago.
+  //`franjas` cachea el listado exacto mostrado, para que elegir "3" siempre
+  //mapee al mismo horario aunque la disponibilidad cambie mientras responde.
+  programado?: boolean;
+  franjas?: { inicio: string; fin: string }[];
+  horaProgramada?: Date;
+  //Nota de alergias/instrucciones especiales, pendiente de confirmar.
+  nota?: string;
+  //Pago: método elegido, comprobante de transferencia recibido, o monto con el
+  //que paga en efectivo (para calcular el vuelto). Pendientes hasta la
+  //confirmación final.
+  metodoPago?: "efectivo" | "transferencia";
+  comprobanteImagen?: string;
+  montoRecibido?: number;
+  //Entrega: modalidad, y dirección de despacho (solo si delivery).
+  modalidad?: "delivery" | "retiro";
+  direccion?: string;
+  //Última vez que se accedió para escribir (ver pedido()); lo usa la purga por
+  //inactividad de más abajo.
+  actualizadoEn?: number;
+}
+
+//Sin prototipo: la clave es un identificador que viene del mensaje entrante, y en
+//un `{}` normal una clave "__proto__" haría que pedido() devuelva Object.prototype
+//y le escriba campos (contaminación de prototipo global).
+const pedidosPendientes: Record<string, PedidoPendiente> = Object.create(null);
+
+//Devuelve el pedido pendiente del cliente, creándolo vacío si no existía. Usar
+//solo para escribir o cuando ya se sabe que hay una conversación en curso.
+function pedido(numeroTelefono: string): PedidoPendiente {
+  const p = (pedidosPendientes[numeroTelefono] ??= {});
+  p.actualizadoEn = Date.now();
+  return p;
+}
+
+//Solo lectura del estado: NO crea la entrada (un saludo suelto de alguien que
+//nunca arma un pedido no debe dejar basura en memoria).
+function estadoDe(numeroTelefono: string): EstadoConversacion | undefined {
+  return pedidosPendientes[numeroTelefono]?.estado;
+}
+
+//Borra TODO el estado en memoria de un cliente de una sola vez. Al ser un solo
+//objeto por cliente, ya no hay forma de "olvidarse" de limpiar uno de varios
+//campos sueltos (bug real que ya pasó dos veces: método de pago/comprobante
+//mezclados entre intentos, y "reset" dejando el carrito anterior colgado).
+function limpiarPedidoPendiente(numeroTelefono: string): void {
+  delete pedidosPendientes[numeroTelefono];
+}
+
+//Purga por inactividad: sin esto, cada conversación abandonada a mitad de un pedido
+//quedaba en memoria para siempre — y el comprobante de transferencia se guarda como
+//base64 (hasta varios MB por cliente), así que en un servidor chico se acumulaba
+//hasta quedarse sin memoria. No se purgan los estados que deben sobrevivir aunque el
+//cliente no escriba: PROCESANDO_PEDIDO (se está guardando) y HABLANDO_CON_HUMANO
+//(el bot debe seguir callado hasta que el equipo lo devuelva desde el dashboard).
+const INACTIVIDAD_MAXIMA_MS = 24 * 60 * 60 * 1000;
+setInterval(() => {
+  const limite = Date.now() - INACTIVIDAD_MAXIMA_MS;
+  for (const numeroTelefono of Object.keys(pedidosPendientes)) {
+    const p = pedidosPendientes[numeroTelefono];
+    if (p.estado === "PROCESANDO_PEDIDO" || p.estado === "HABLANDO_CON_HUMANO") continue;
+    if ((p.actualizadoEn ?? 0) < limite) delete pedidosPendientes[numeroTelefono];
+  }
+}, 60 * 60 * 1000).unref();
 
 //Simulación manual del horario (ADR-002) para pruebas, sin tocar HorarioAtencion
 //ni afectar a ningún cliente real. No existe fuera de NODE_ENV !== "production",
@@ -107,7 +171,7 @@ function esConsultaEstado(textoCliente: string): boolean {
   return PATRON_CONSULTA_ESTADO.test(normalizarTexto(textoCliente));
 }
 
-function mensajeMetodoPago(modalidad: "delivery" | "retiro"): string {
+function mensajeMetodoPago(modalidad?: "delivery" | "retiro"): string {
   const notaEnvio =
     modalidad === "delivery"
       ? "\n\n📦 Recuerda: el envío se paga solo por transferencia bancaria (la comida la puedes pagar en efectivo)."
@@ -212,11 +276,15 @@ async function generarListaCategorias(): Promise<string> {
 
 //categoriaId=null → "ver todo el menú" (agrupado por categoría, numeración
 //continua). Con categoriaId → solo esa categoría, numeración 1..N reiniciada.
-//Devuelve también el mapa código→producto para guardar en menuActualPendiente.
+//Devuelve también el mapa código→producto para guardar en PedidoPendiente.menuActual.
 async function generarMenuCategoria(
   categoriaId: string | null
 ): Promise<{ texto: string; codigos: Record<string, CarritoItem> }> {
-  const codigos: Record<string, CarritoItem> = {};
+  //Sin prototipo a propósito: el texto que escribe el cliente se usa como clave
+  //(menuActual[textoCliente]), y con un `{}` normal escribir "constructor" o
+  //"toString" devolvía una propiedad heredada de Object (truthy) que se agregaba
+  //al carrito como un plato "undefined", dejando al cliente sin respuesta.
+  const codigos: Record<string, CarritoItem> = Object.create(null);
   let contador = 0;
 
   if (categoriaId) {
@@ -267,11 +335,11 @@ async function mostrarMenuOAgendar(
       await responder(MENSAJE_CERRADO_SIN_AGENDA);
       return;
     }
-    estadosUsuarios[numeroTelefono] = "ESPERANDO_CONFIRMAR_AGENDA";
+    pedido(numeroTelefono).estado = "ESPERANDO_CONFIRMAR_AGENDA";
     await responder(`🕒 Ahora estamos cerrados. Volvemos a abrir hoy a las ${franjas[0].inicio}. ¿Quieres agendar tu pedido para más tarde? Responde *SI* o *NO*.`);
     return;
   }
-  estadosUsuarios[numeroTelefono] = "ELIGIENDO_CATEGORIA";
+  pedido(numeroTelefono).estado = "ELIGIENDO_CATEGORIA";
   await responder(`${prefijoSiAbierto}${await generarListaCategorias()}`);
 }
 
@@ -373,8 +441,669 @@ async function calcularTiempoEstimado(itemsNuevoPedido: CarritoItem[]): Promise<
 //Logger silencioso: Baileys es muy verboso por defecto (loguea cada paquete de protocolo).
 const logger = pino({ level: "error" });
 
-//Procesa un mensaje entrante. Recibe un helper `responder` en vez de msg.reply()
-//(que no existe en Baileys) para mantener el resto de la lógica casi intacta.
+//Contexto de un mensaje entrante, compartido por todos los manejadores de
+//estado. `ContextoMensaje` agrega el Cliente de la BD, que solo existe después de
+//buscarlo/crearlo (los manejadores previos a eso usan `ContextoBase`).
+interface ContextoBase {
+  numeroTelefono: string;
+  textoCliente: string;
+  responder: (texto: string) => Promise<unknown>;
+  enviarDatosBancarios: () => Promise<void>;
+  notificarStaff: (texto: string) => Promise<unknown>;
+}
+interface ContextoMensaje extends ContextoBase {
+  cliente: Cliente;
+  fueCreado: boolean;
+}
+
+//Cliente atendido por una persona: el bot se queda callado para no interrumpir
+//la conversación manual hasta que alguien del equipo lo devuelva al bot desde
+//el dashboard.
+async function manejarHablandoConHumano(): Promise<void> {}
+
+//Si llegó texto en vez de una imagen mientras se esperaba el comprobante (la
+//imagen en sí se maneja antes, en manejarMensajeEntrante, porque el transporte
+//necesita descargarla). También permite corregir el método de pago si el
+//cliente eligió "transferencia" por error.
+async function manejarEsperandoComprobante(ctx: ContextoBase): Promise<void> {
+  const { numeroTelefono, textoCliente, responder } = ctx;
+  const p = pedido(numeroTelefono);
+  const comando = textoCliente.toLowerCase().trim();
+  if (comando === "cambiar" || comando === "efectivo" || comando === "cambiar metodo" || comando === "cambiar método") {
+    delete p.metodoPago;
+    // Se estaba esperando comprobante de transferencia — si vuelve a efectivo,
+    // ese comprobante (si llegó a mandar uno antes) ya no aplica. Sin este
+    // borrado, un pedido en efectivo podía quedar guardado con una imagen de
+    // comprobante de un intento de transferencia anterior.
+    delete p.comprobanteImagen;
+    p.estado = "PIDIENDO_METODO_PAGO";
+    await responder(mensajeMetodoPago(p.modalidad));
+    return;
+  }
+  await responder('Por favor envía la *imagen* del comprobante de transferencia (foto o captura de pantalla). Si te equivocaste y quieres pagar en *efectivo*, escribe *cambiar*.');
+}
+
+//Candado contra doble confirmación: si el cliente manda "SI" dos veces seguido
+//(impaciencia, o un reintento de WhatsApp con otro id de mensaje — el dedup por
+//message.id no lo detecta), el segundo mensaje puede llegar mientras el primero
+//todavía está guardando el pedido en la BD (varios `await` entre leer el carrito
+//y borrarlo). manejarConfirmandoPedido pasa el estado a PROCESANDO_PEDIDO de
+//forma síncrona, antes del primer `await`, y cualquier mensaje que llegue
+//mientras tanto termina acá en vez de crear un segundo Pedido.
+async function manejarProcesandoPedido(ctx: ContextoBase): Promise<void> {
+  await ctx.responder("⏳ Ya estoy procesando tu pedido, dame un segundo...");
+}
+
+// ESPERANDO_NOMBRE: cliente nuevo, se le pide su primer nombre para registrarlo.
+async function manejarEsperandoNombre(ctx: ContextoBase): Promise<void> {
+  const { numeroTelefono, textoCliente, responder } = ctx;
+  const p = pedido(numeroTelefono);
+  const soloLetras = /^[A-Za-zÁÉÍÓÚáéíóúÑñ]+$/;
+
+  if (!soloLetras.test(textoCliente)) {
+    await responder("❌ Formato inválido. Por favor, ingresa *solamente tu primer nombre* (sin espacios, ni números).");
+    return;
+  }
+
+  await Cliente.update(
+    { nombre: textoCliente },
+    { where: { telefono: numeroTelefono } }
+  );
+
+  delete p.estado;
+  await responder(`¡Perfecto, ${textoCliente}! Ya guardé tus datos. 🍔 ¿Qué te gustaría pedir hoy?\n\n1️⃣ Ver Menú\n2️⃣ Hablar con un humano`);
+  return;
+}
+
+// ESPERANDO_CONFIRMAR_AGENDA: el local está cerrado, ¿quiere agendar su pedido? (ver ADR-002)
+async function manejarEsperandoConfirmarAgenda(ctx: ContextoMensaje): Promise<void> {
+  const { numeroTelefono, textoCliente, responder } = ctx;
+  const p = pedido(numeroTelefono);
+  const respuesta = textoCliente.toLowerCase();
+  if (respuesta === "si" || respuesta === "sí") {
+    p.programado = true;
+    p.estado = "ELIGIENDO_CATEGORIA";
+    await responder(await generarListaCategorias());
+    return;
+  }
+  if (respuesta === "no") {
+    delete p.estado;
+    await responder("Sin problema, te esperamos en nuestro horario de atención. ¡Hasta pronto! 👋");
+    return;
+  }
+  await responder("Por favor responde *SI* o *NO*.");
+  return;
+}
+
+// PIDIENDO_MODALIDAD: delivery o retiro.
+// Va justo después de "pagar" y antes del método de pago (ver ADR en el handoff).
+async function manejarPidiendoModalidad(ctx: ContextoMensaje): Promise<void> {
+  const { numeroTelefono, textoCliente, responder } = ctx;
+  const p = pedido(numeroTelefono);
+  if (textoCliente === "1" || textoCliente === "2") {
+    const modalidad: "delivery" | "retiro" = textoCliente === "1" ? "delivery" : "retiro";
+    p.modalidad = modalidad;
+    const prefijo = modalidad === "retiro" ? `📍 Retiras en nuestro local: ${DIRECCION_LOCAL}\n\n` : "";
+
+    // Pedido agendado (ver ADR-002): en vez de ir directo al método de pago,
+    // pregunta la hora dentro de los turnos que quedan hoy.
+    if (p.programado) {
+      const franjas = await calcularFranjasDisponibles(configuracionBot.duracionFranjaMin, configuracionBot.capacidadPorFranja);
+      if (franjas.length === 0) {
+        // Se llenaron los horarios mientras elegía la modalidad (raro, pero posible).
+        delete p.programado;
+        p.estado = "PIDIENDO_METODO_PAGO";
+        await responder(`${prefijo}Se acaban de llenar los horarios disponibles para agendar hoy.\n\n${mensajeMetodoPago(modalidad)}`);
+        return;
+      }
+      p.franjas = franjas;
+      p.estado = "ELIGIENDO_HORA_PROGRAMADA";
+      const lista = franjas.map((f, i) => `${numeroEmoji(i + 1)} ${f.inicio}-${f.fin}`).join("\n");
+      await responder(`${prefijo}🗓️ ¿Para qué hora lo necesitas?\n\n${lista}`);
+      return;
+    }
+
+    p.estado = "PIDIENDO_METODO_PAGO";
+    await responder(`${prefijo}${mensajeMetodoPago(modalidad)}`);
+    return;
+  }
+  await responder("Por favor responde *1* para Delivery o *2* para Retiro en el local.");
+  return;
+}
+
+// ELIGIENDO_HORA_PROGRAMADA: elige una de las franjas horarias de un pedido agendado (ver ADR-002).
+async function manejarEligiendoHoraProgramada(ctx: ContextoMensaje): Promise<void> {
+  const { numeroTelefono, textoCliente, responder } = ctx;
+  const p = pedido(numeroTelefono);
+  const franjas = p.franjas ?? [];
+  const elegida = franjas[Number(textoCliente) - 1];
+  if (!elegida) {
+    await responder("Por favor elige un número válido de la lista de horarios.");
+    return;
+  }
+  p.horaProgramada = horaChileAFecha(elegida.inicio);
+  p.estado = "PIDIENDO_METODO_PAGO";
+  await responder(mensajeMetodoPago(p.modalidad));
+  return;
+}
+
+// ELIGIENDO_CATEGORIA: elige una categoría del menú (o 0 para verlo todo).
+async function manejarEligiendoCategoria(ctx: ContextoMensaje): Promise<void> {
+  const { numeroTelefono, textoCliente, responder } = ctx;
+  const p = pedido(numeroTelefono);
+  if (textoCliente === "0") {
+    const { texto, codigos } = await generarMenuCategoria(null);
+    p.menuActual = codigos;
+    p.estado = "REALIZANDO_PEDIDO";
+    await responder(texto);
+    return;
+  }
+  const categorias = await Categoria.findAll({ order: [["orden", "ASC"]] });
+  const categoria = categorias[Number(textoCliente) - 1];
+  if (!categoria) {
+    await responder('Por favor elige un número válido de categoría, o *0* para ver todo el menú.');
+    return;
+  }
+  const { texto, codigos } = await generarMenuCategoria(categoria.id);
+  p.menuActual = codigos;
+  p.estado = "REALIZANDO_PEDIDO";
+  await responder(texto);
+  return;
+}
+
+// PIDIENDO_METODO_PAGO: efectivo o transferencia.
+async function manejarPidiendoMetodoPago(ctx: ContextoMensaje): Promise<void> {
+  const { numeroTelefono, textoCliente, responder, enviarDatosBancarios } = ctx;
+  const p = pedido(numeroTelefono);
+  if (textoCliente === "1") {
+    p.metodoPago = "efectivo";
+    // Si venía de haber elegido transferencia antes (por ejemplo, dijo "no"
+    // en la confirmación y cambió de método), ese comprobante ya no aplica —
+    // sin este borrado quedaba pegado a un pedido que ahora es en efectivo.
+    delete p.comprobanteImagen;
+    p.estado = "PIDIENDO_MONTO_EFECTIVO";
+    const { total } = formatResumenCarrito(p.carrito ?? [], "");
+    await responder(`💵 Tu pedido suma *$${total.toLocaleString("es-CL")}*. ¿Con qué billete vas a pagar, para llevarte el vuelto justo? (escribe solo el monto, ej: 10000)`);
+    return;
+  }
+  if (textoCliente === "2") {
+    p.metodoPago = "transferencia";
+    // Mismo caso al revés: un monto en efectivo de un intento anterior no
+    // debe seguir mostrándose como "pagas con / vuelto" en un pedido que
+    // ahora es por transferencia (bug real reportado: "vuelto: -$8.500").
+    delete p.montoRecibido;
+    p.estado = "ESPERANDO_COMPROBANTE";
+    await enviarDatosBancarios();
+    await responder("📸 Envía la *imagen* de tu comprobante de transferencia (foto o captura de pantalla).");
+    return;
+  }
+  await responder("Por favor responde *1* para Efectivo o *2* para Transferencia.");
+  return;
+}
+
+// PIDIENDO_MONTO_EFECTIVO: con qué billete paga, para calcular el vuelto justo.
+async function manejarPidiendoMontoEfectivo(ctx: ContextoMensaje): Promise<void> {
+  const { numeroTelefono, textoCliente, responder } = ctx;
+  const p = pedido(numeroTelefono);
+  const comandoCambiar = textoCliente.toLowerCase().trim();
+  if (comandoCambiar === "cambiar" || comandoCambiar === "transferencia" || comandoCambiar === "cambiar metodo" || comandoCambiar === "cambiar método") {
+    delete p.metodoPago;
+    p.estado = "PIDIENDO_METODO_PAGO";
+    await responder(mensajeMetodoPago(p.modalidad));
+    return;
+  }
+  const monto = Number(textoCliente.replace(/[^\d]/g, ""));
+  if (!monto) {
+    await responder("Por favor escribe solo el monto en números, ej: 10000. Si te equivocaste y quieres pagar por *transferencia*, escribe *cambiar*.");
+    return;
+  }
+  const { total } = formatResumenCarrito(p.carrito ?? [], "");
+  if (monto < total) {
+    await responder(`Ese monto no alcanza a cubrir el total ($${total.toLocaleString("es-CL")}). Escribe un monto igual o mayor.`);
+    return;
+  }
+  p.montoRecibido = monto;
+
+  if (p.modalidad === "delivery") {
+    p.estado = "PIDIENDO_DIRECCION";
+    await responder("📍 Pásame tu dirección de entrega (calle, número, comuna).");
+  } else {
+    p.estado = "PIDIENDO_NOTA";
+    await responder("📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
+  }
+  return;
+}
+
+// PIDIENDO_DIRECCION: dirección de despacho (solo delivery).
+async function manejarPidiendoDireccion(ctx: ContextoMensaje): Promise<void> {
+  const { numeroTelefono, textoCliente, responder } = ctx;
+  const p = pedido(numeroTelefono);
+  p.direccion = textoCliente;
+  p.estado = "PIDIENDO_NOTA";
+  await responder("📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
+  return;
+}
+
+// PIDIENDO_NOTA: alergias o instrucciones especiales; después muestra el resumen para confirmar.
+async function manejarPidiendoNota(ctx: ContextoMensaje): Promise<void> {
+  const { numeroTelefono, textoCliente, responder } = ctx;
+  const p = pedido(numeroTelefono);
+  const nota = textoCliente.toLowerCase() === "no" ? "" : textoCliente;
+  p.nota = nota;
+  p.estado = "CONFIRMANDO_PEDIDO";
+
+  const miCarrito = p.carrito ?? [];
+  const horaProgramadaPreview = p.horaProgramada;
+  const { texto } = formatResumenCarrito(miCarrito, nota, {
+    metodoPago: p.metodoPago,
+    modalidad: p.modalidad,
+    direccion: p.direccion,
+    montoRecibido: p.montoRecibido,
+    horaProgramadaTexto: horaProgramadaPreview ? formatHoraChile(horaProgramadaPreview) : undefined,
+  });
+  await responder(`*🧾 REVISA TU PEDIDO ANTES DE ENVIARLO:*\n\n${texto}\n\n¿Confirmas? Responde *SI* para mandarlo a cocina o *NO* para seguir editando.`);
+  return;
+}
+
+// CONFIRMANDO_PEDIDO: confirmación final.
+// Existe para evitar pedidos "fantasma": nada se guarda en la cocina hasta
+// que el cliente confirma explícitamente con SI.
+async function manejarConfirmandoPedido(ctx: ContextoMensaje): Promise<void> {
+  const { numeroTelefono, textoCliente, responder, notificarStaff, cliente, fueCreado } = ctx;
+  const p = pedido(numeroTelefono);
+  const respuesta = textoCliente.toLowerCase();
+
+  if (respuesta === "no") {
+    p.estado = "REALIZANDO_PEDIDO";
+    // OJO: metodoPago/comprobante/modalidad/dirección/monto NO se borran acá.
+    // "NO" significa "déjame seguir agregando platos" (es literal lo que dice
+    // el mensaje de abajo) — esa información ya la dio el cliente y sigue
+    // siendo válida. Borrarla obligaba a mandar el comprobante de transferencia
+    // una segunda vez al volver a escribir "pagar" (bug reportado por el cliente
+    // real: ver el chequeo de "ya resuelto" en el handler de "pagar" más abajo).
+    // OJO: pedidosProgramadosPendientes NO se borra acá — si seguía cerrado
+    // cuando confirmó "no", al volver a escribir "pagar" debe recalcular
+    // franjas y volver a pedir la hora, no colarse como pedido en tiempo
+    // real (ver ADR-002). Solo se limpia lo que hay que recalcular de cero.
+    delete p.franjas;
+    delete p.horaProgramada;
+    await responder("Sin problema, sigue agregando platos o escribe *pagar* cuando estés listo.");
+    return;
+  }
+
+  if (respuesta !== "si" && respuesta !== "sí") {
+    await responder("Por favor responde *SI* para confirmar tu pedido o *NO* para seguir editando.");
+    return;
+  }
+
+  const miCarrito = p.carrito;
+  if (!miCarrito || miCarrito.length === 0) {
+    p.estado = "REALIZANDO_PEDIDO";
+    await responder("Tu carrito quedó vacío, escribe un código válido (ej: 11) para agregar algo.");
+    return;
+  }
+
+  // A partir de acá empiezan los `await` a la BD — se traba el estado antes
+  // del primero para que un "SI" duplicado (ver candado más arriba) no vea
+  // "CONFIRMANDO_PEDIDO" de nuevo mientras este pedido se sigue guardando.
+  p.estado = "PROCESANDO_PEDIDO";
+
+  const nota = p.nota ?? "";
+  const metodoPago = p.metodoPago;
+  const comprobanteImagen = p.comprobanteImagen ?? null;
+  const modalidad = p.modalidad ?? null;
+  const direccion = p.direccion ?? null;
+  const montoRecibido = p.montoRecibido ?? null;
+  const horaProgramada = p.horaProgramada ?? null;
+
+  // Revalidación final de la hora agendada (ver ADR-002): la disponibilidad
+  // se chequeó una sola vez, cuando se mostró la lista de horarios, varios
+  // mensajes atrás (modalidad → hora → método de pago → comprobante/monto →
+  // nota → confirmar). Si otro cliente reservó esa misma franja mientras
+  // tanto, sin este chequeo el pedido se creaba igual, duplicando la hora
+  // (bug real reportado: dos pedidos para las 9:30). Se revisa recién acá,
+  // justo antes de guardar, contra el estado actual de la BD.
+  if (horaProgramada) {
+    const finFranja = new Date(horaProgramada.getTime() + configuracionBot.duracionFranjaMin * 60000);
+    const ocupados = await Pedido.count({
+      where: {
+        horaProgramada: { [Op.gte]: horaProgramada, [Op.lt]: finFranja },
+        estado: { [Op.ne]: "cancelado" },
+      },
+    });
+    if (ocupados >= configuracionBot.capacidadPorFranja) {
+      const franjas = await calcularFranjasDisponibles(configuracionBot.duracionFranjaMin, configuracionBot.capacidadPorFranja);
+      delete p.horaProgramada;
+      if (franjas.length === 0) {
+        delete p.programado;
+        delete p.franjas;
+        p.estado = "CONFIRMANDO_PEDIDO";
+        await responder("😕 Justo se acaba de ocupar ese horario y no quedan más disponibles por hoy. Escribe *SI* para mandarlo en tiempo real apenas abramos, o *NO* para seguir editando.");
+        return;
+      }
+      p.franjas = franjas;
+      p.estado = "ELIGIENDO_HORA_PROGRAMADA";
+      const lista = franjas.map((f, i) => `${numeroEmoji(i + 1)} ${f.inicio}-${f.fin}`).join("\n");
+      await responder(`😕 Justo se acaba de ocupar ese horario. Elige otro:\n\n${lista}`);
+      return;
+    }
+  }
+
+  const { texto: resumenItems, total } = formatResumenCarrito(miCarrito, nota, {
+    metodoPago,
+    modalidad: modalidad ?? undefined,
+    direccion: direccion ?? undefined,
+    montoRecibido: montoRecibido ?? undefined,
+    horaProgramadaTexto: horaProgramada ? formatHoraChile(horaProgramada) : undefined,
+  });
+  // Un pedido agendado ya tiene una hora comprometida — no tiene sentido
+  // mostrarle además un rango de espera "en vivo" (ver ADR-002).
+  const tiempoEstimado = horaProgramada ? null : await calcularTiempoEstimado(miCarrito);
+  const lineaTiempo = horaProgramada
+    ? `🗓️ Tu pedido quedó agendado para las ${formatHoraChile(horaProgramada)}.`
+    : `⏱️ Tiempo estimado: ${tiempoEstimado!.min}-${tiempoEstimado!.max} min`;
+  const resumen = `*🧾 RESUMEN DE TU PEDIDO:*\n\n${resumenItems}\n${lineaTiempo}\n\n¡Tu pedido ha sido confirmado! 🧑‍🍳 En breve te contactaremos para coordinar el pago y la entrega.`;
+
+  // ============ PERSISTENCIA EN BD ============
+  // Guarda el pedido y sus detalles para que sobreviva a un reinicio del bot
+  // y quede disponible aunque ningún dashboard esté conectado al emitirse.
+  let pedidoId: string = `pedido_${Date.now()}`;
+  //Cuántos pedidos anteriores de este cliente quedaron marcados "cancelado"
+  //(el equipo los usa para marcar "no llegó" desde el dashboard). Se avisa al
+  //equipo en el mismo pedido nuevo para que decidan si piden algo extra de
+  //garantía antes de empezar a cocinar.
+  let noShows = 0;
+  try {
+    // Diagnóstico: se detectaron pedidos guardados con cliente_id NULL (el
+    // teléfono no aparece en el dashboard) sin poder reproducir la causa por
+    // lectura de código — si vuelve a pasar, este log debería decir por qué
+    // `cliente` llegó roto hasta acá.
+    if (!cliente?.id) {
+      console.error("[BUG cliente_id] cliente inválido al crear el pedido:", { numeroTelefono, cliente, fueCreado });
+    }
+
+    noShows = await Pedido.count({ where: { cliente_id: cliente.id, estado: "cancelado" } });
+
+    const nuevoPedido = await Pedido.create({
+      cliente_id: cliente.id,
+      estado: "pendiente",
+      total,
+      notas: nota || null,
+      metodoPago: metodoPago ?? null,
+      comprobanteImagen,
+      modalidad,
+      direccion,
+      montoRecibido,
+      tiempoEstimadoMin: tiempoEstimado?.min ?? null,
+      tiempoEstimadoMax: tiempoEstimado?.max ?? null,
+      horaProgramada,
+    });
+    pedidoId = nuevoPedido.id;
+
+    // Los items ya vienen con productoId real (elegidos del menú por categorías,
+    // ver ELIGIENDO_CATEGORIA) — ya no hace falta buscar/crear por nombre.
+    for (const item of miCarrito) {
+      await DetallePedido.create({
+        pedido_id: nuevoPedido.id,
+        producto_id: item.productoId,
+        cantidad: 1,
+        precio_unitario: item.precio,
+      });
+    }
+  } catch (dbErr) {
+    // No rompemos el flujo del cliente si la DB falla, pero queda registrado
+    console.error("[DB] No se pudo persistir el pedido:", dbErr);
+  }
+  // ===============================================================
+
+  // ============ EMITIR EVENTO SOCKET.IO: nuevo_pedido ============
+  // IMPORTANTE: Esta es la integración pedida. El Dashboard recibe tiempo real.
+  try {
+    const { getIO } = await import("../config/socket.js");
+    const io = getIO();
+
+    const pedidoPayload = {
+      id: pedidoId,
+      cliente: {
+        telefono: numeroTelefono,
+        nombre: cliente.nombre,
+        whatsapp: `${numeroTelefono}@s.whatsapp.net`,
+      },
+      items: [...miCarrito],
+      total,
+      resumen: nota,
+      metodoPago: metodoPago ?? null,
+      comprobanteImagen,
+      clienteNoShows: noShows,
+      modalidad,
+      direccion,
+      montoRecibido,
+      tiempoEstimadoMin: tiempoEstimado?.min ?? null,
+      tiempoEstimadoMax: tiempoEstimado?.max ?? null,
+      horaProgramada: horaProgramada ? horaProgramada.toISOString() : null,
+      fecha: new Date().toISOString(),
+    };
+
+    // Un pedido agendado no debe aparecer en el feed de "activos ahora" del
+    // dashboard (la cocina no debe empezarlo antes de tiempo) — va a su propia
+    // sección, alimentada por este evento distinto (ver GET /api/pedidos/programados).
+    const evento = horaProgramada ? "nuevo_pedido_programado" : "nuevo_pedido";
+    io.emit(evento, pedidoPayload);
+
+    console.log(`[Socket.IO] Evento '${evento}' emitido para ${numeroTelefono} total $${total.toLocaleString("es-CL")}`);
+  } catch (socketErr) {
+    // No romper el flujo del pedido si Socket.IO aún no está listo
+    // En producción podrías persistir en DB y hacer polling fallback
+    const message = socketErr instanceof Error ? socketErr.message : String(socketErr);
+    console.warn("[Socket.IO] No se pudo emitir nuevo_pedido:", message);
+  }
+  // ===============================================================
+
+  // ============ AVISO ADICIONAL POR WHATSAPP (opcional) ============
+  // Parche para cuando el sonido del dashboard no es confiable (celular
+  // bloqueado): un WhatsApp corto al número de turno, además del evento de
+  // socket de arriba — no lo reemplaza, solo funciona como alarma.
+  if (configuracionBot.notificacionesWhatsappActivas && configuracionBot.numeroNotificaciones) {
+    const avisoModalidad = horaProgramada
+      ? `🗓️ agendado ${formatHoraChile(horaProgramada)}`
+      : modalidad === "retiro"
+        ? "🏪 retiro en local"
+        : "🛵 delivery";
+    console.log(`[WhatsApp] Enviando aviso de pedido nuevo a ${configuracionBot.numeroNotificaciones}...`);
+    await notificarStaff(
+      `🔔 *Pedido nuevo* — ${cliente.nombre}\n${miCarrito.length} plato(s) · $${total.toLocaleString("es-CL")} · ${avisoModalidad}\n\nRevisa el dashboard para los detalles.`
+    );
+    console.log("[WhatsApp] Aviso de pedido nuevo enviado sin errores.");
+  } else {
+    // Diagnóstico: si esto aparece, el aviso no se manda porque la caché en
+    // memoria no ve el toggle activado o el número — aunque la DB lo tenga
+    // guardado bien, puede que este proceso arrancó antes de guardarlo, o que
+    // cargarConfiguracionBot() falló al arrancar (ver warning más arriba).
+    console.log(
+      `[WhatsApp] Aviso de pedido nuevo NO enviado — notificacionesWhatsappActivas=${configuracionBot.notificacionesWhatsappActivas}, numeroNotificaciones=${configuracionBot.numeroNotificaciones ?? "null"}`
+    );
+  }
+  // ===============================================================
+
+  // Limpieza de memoria
+  limpiarPedidoPendiente(numeroTelefono);
+
+  await responder(resumen);
+  return;
+}
+
+// REALIZANDO_PEDIDO: el cliente está armando su carrito (pagar / listo / carrito / quitar / código de plato).
+async function manejarRealizandoPedido(ctx: ContextoMensaje): Promise<void> {
+  const { numeroTelefono, textoCliente, responder } = ctx;
+  const p = pedido(numeroTelefono);
+  // a) Si el cliente quiere pagar: pasa a pedir nota + confirmación antes de
+  // crear nada en firme (ver estados PIDIENDO_METODO_PAGO / PIDIENDO_NOTA /
+  // CONFIRMANDO_PEDIDO arriba).
+  if (textoCliente.toLowerCase() === "pagar") {
+    const miCarrito = p.carrito;
+
+    if (!miCarrito || miCarrito.length === 0) {
+      await responder("Tu carrito está vacío. Por favor escribe un código válido (ej: 11).");
+      return;
+    }
+
+    // ¿Ya resolvió modalidad + pago en un intento anterior (dijo "no" solo
+    // para agregar más platos)? Si sigue siendo válido, no tiene sentido
+    // volver a pedir la modalidad, el método de pago ni el comprobante —
+    // se salta directo a la nota con el carrito actualizado.
+    const modalidad = p.modalidad;
+    const metodoPago = p.metodoPago;
+    const direccionResuelta = !modalidad || modalidad === "retiro" || !!p.direccion;
+    const { total: totalActual } = formatResumenCarrito(miCarrito, "");
+    const pagoResuelto =
+      metodoPago === "transferencia" ? !!p.comprobanteImagen :
+        metodoPago === "efectivo" ? (p.montoRecibido ?? 0) >= totalActual :
+          false;
+    // Si es un pedido agendado, la hora elegida también se borró al decir "no"
+    // (ver ADR-002 — puede haber pasado tiempo y las franjas ya no ser las
+    // mismas), así que si falta hay que volver a pedirla, no saltarla.
+    const horaResuelta = !p.programado || !!p.horaProgramada;
+
+    if (modalidad && metodoPago && pagoResuelto && direccionResuelta && horaResuelta) {
+      p.estado = "PIDIENDO_NOTA";
+      await responder("📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
+      return;
+    }
+
+    p.estado = "PIDIENDO_MODALIDAD";
+    await responder("🛵 ¿Tu pedido es para *delivery* o *retiro* en el local?\n\n1️⃣ Delivery\n2️⃣ Retiro en el local");
+    return;
+  }
+
+  // b) Si el cliente quiere ver las categorías de nuevo (para seguir agregando
+  // platos de otra categoría al mismo pedido, ver ELIGIENDO_CATEGORIA).
+  if (textoCliente.toLowerCase() === "listo") {
+    p.estado = "ELIGIENDO_CATEGORIA";
+    await responder(await generarListaCategorias());
+    return;
+  }
+
+  // c-bis) Ver el carrito o corregir un plato agregado por error (ver el mismo
+  // pedido del owner que dio origen al "cambiar" de método de pago).
+  if (textoCliente.toLowerCase() === "carrito") {
+    const miCarrito = p.carrito ?? [];
+    if (miCarrito.length === 0) {
+      await responder("Tu carrito está vacío todavía. Escribe un código del menú para agregar un plato.");
+      return;
+    }
+    const lineas = miCarrito.map((item, i) => `${numeroEmoji(i + 1)} ${item.nombre} - $${item.precio.toLocaleString("es-CL")}`);
+    await responder(`🛒 *Tu pedido hasta ahora:*\n\n${lineas.join("\n")}\n\n👉 Escribe *quitar <número>* para eliminar un plato (ej: quitar 2), o sigue agregando códigos.`);
+    return;
+  }
+
+  const matchQuitar = textoCliente.toLowerCase().trim().match(/^quitar(?:\s+(\d+))?$/);
+  if (matchQuitar) {
+    const miCarrito = p.carrito ?? [];
+    if (miCarrito.length === 0) {
+      await responder("Tu carrito ya está vacío, no hay nada que quitar.");
+      return;
+    }
+    // "quitar" sin número saca el último plato agregado (el caso típico de
+    // "me equivoqué de código"); "quitar N" saca uno específico de la lista
+    // mostrada con *carrito*.
+    const posicion = matchQuitar[1] ? Number(matchQuitar[1]) : miCarrito.length;
+    const indice = posicion - 1;
+    if (indice < 0 || indice >= miCarrito.length) {
+      await responder("No encontré ese número en tu carrito. Escribe *carrito* para ver la lista actualizada.");
+      return;
+    }
+    const [eliminado] = miCarrito.splice(indice, 1);
+    await responder(`🗑️ Quité *${eliminado.nombre}* de tu pedido.\n\n👉 Escribe *carrito* para ver lo que queda, otro código para seguir agregando, o *pagar* cuando estés listo.`);
+    return;
+  }
+
+  // d) Si el cliente ingresa un plato (código del último listado mostrado)
+  const productoElegido = p.menuActual?.[textoCliente];
+
+  if (productoElegido) {
+    if (!p.carrito) {
+      p.carrito = [];
+    }
+    p.carrito.push(productoElegido);
+    await responder(`✅ *${productoElegido.nombre}* agregado a tu pedido.\n\n👉 Escribe otro código para seguir en esta categoría. \n✅ *listo* para ver las categorías de nuevo\n 🛒*carrito* para revisar/quitar algo\n 💰*pagar* para enviar tu pedido a la cocina.`);
+  } else {
+    await responder('❌ Código no reconocido. Escribe un número válido del listado, ✅*listo* para ver las categorías, 🛒*carrito* para revisar/quitar algo.💰*pagar* para enviar tu pedido a la cocina.');
+  }
+}
+
+//Cliente sin pedido en curso: consulta de "¿están abiertos?", opciones 1 y 2 del
+//menú principal, y la bienvenida por defecto para cualquier otro texto.
+async function manejarSinPedidoActivo(ctx: ContextoMensaje): Promise<void> {
+  const { numeroTelefono, textoCliente, responder, cliente, fueCreado } = ctx;
+
+  if (esConsultaEstado(textoCliente)) {
+    await mostrarMenuOAgendar(numeroTelefono, responder, "✅ ¡Sí, estamos atendiendo! 🇵🇪\n\n");
+    return;
+  }
+
+  if (textoCliente === "1") {
+    await mostrarMenuOAgendar(numeroTelefono, responder);
+    return;
+  }
+
+  if (textoCliente === "2") {
+    pedido(numeroTelefono).estado = "HABLANDO_CON_HUMANO";
+    delete pedido(numeroTelefono).carrito;
+
+    const desde = new Date();
+    await Cliente.update({ necesitaHumanoDesde: desde }, { where: { telefono: numeroTelefono } });
+
+    void emitirEvento("cliente_necesita_humano", {
+      telefono: numeroTelefono,
+      nombre: cliente.nombre,
+      desde: desde.toISOString(),
+    });
+
+    await responder("👨‍🍳 ¡Entendido! Un miembro de nuestro equipo leerá tu mensaje y te atenderá en unos minutos. ¡Gracias por tu paciencia!");
+    return;
+  }
+
+  // Bienvenida por defecto. No intentamos reconocer cada variante de "hola"
+  // (wena, wenas, wenos días, holaaaa, ola, etc. — son infinitas): un cliente sin
+  // pedido en curso solo tiene como comandos válidos "1" y "2" (arriba), así que
+  // cualquier otro texto no tiene otro significado posible que "está iniciando la
+  // conversación". Esto también evita que un saludo raro deje al bot mudo.
+  if (fueCreado || !cliente.nombre || cliente.nombre.trim() === "Por definir") {
+    pedido(numeroTelefono).estado = "ESPERANDO_NOMBRE";
+    await responder("¡Hola! Soy el asistente virtual de UrbanPerú 🇵🇪. Veo que es tu primera vez pidiendo con nosotros. ¿Me podrías decir tu nombre para registrarte?");
+  } else {
+    await responder(`¡Hola de nuevo, ${cliente.nombre}! 🇵🇪 ¿Qué vas a servirte hoy?\n\n1️⃣ Ver Menú\n2️⃣ Hablar con un humano`);
+  }
+}
+
+//Estados que se resuelven sin necesitar al Cliente de la BD.
+const MANEJADORES_SIN_CLIENTE: Partial<Record<EstadoConversacion, (ctx: ContextoBase) => Promise<void>>> = {
+  HABLANDO_CON_HUMANO: manejarHablandoConHumano,
+  ESPERANDO_COMPROBANTE: manejarEsperandoComprobante,
+  PROCESANDO_PEDIDO: manejarProcesandoPedido,
+  ESPERANDO_NOMBRE: manejarEsperandoNombre,
+};
+
+//Un manejador por estado de la conversación. Un cliente sin estado (o con uno
+//que no figura acá) cae en manejarSinPedidoActivo.
+const MANEJADORES: Partial<Record<EstadoConversacion, (ctx: ContextoMensaje) => Promise<void>>> = {
+  PROCESANDO_PEDIDO: manejarProcesandoPedido,
+  ESPERANDO_CONFIRMAR_AGENDA: manejarEsperandoConfirmarAgenda,
+  PIDIENDO_MODALIDAD: manejarPidiendoModalidad,
+  ELIGIENDO_HORA_PROGRAMADA: manejarEligiendoHoraProgramada,
+  ELIGIENDO_CATEGORIA: manejarEligiendoCategoria,
+  PIDIENDO_METODO_PAGO: manejarPidiendoMetodoPago,
+  PIDIENDO_MONTO_EFECTIVO: manejarPidiendoMontoEfectivo,
+  PIDIENDO_DIRECCION: manejarPidiendoDireccion,
+  PIDIENDO_NOTA: manejarPidiendoNota,
+  CONFIRMANDO_PEDIDO: manejarConfirmandoPedido,
+  REALIZANDO_PEDIDO: manejarRealizandoPedido,
+};
+
+//Punto de entrada por mensaje de texto: atiende los comandos globales (reset y los
+//de prueba), y después despacha según el estado de la conversación del cliente
+//— ver MANEJADORES_SIN_CLIENTE y MANEJADORES arriba. Recibe `responder` en vez de
+//msg.reply() (que no existe en Baileys) para no depender de un transporte.
 async function manejarMensaje(
   numeroTelefono: string,
   textoCliente: string,
@@ -384,7 +1113,7 @@ async function manejarMensaje(
 ): Promise<void> {
   if (textoCliente.toLowerCase() === "reset") {
     await Cliente.destroy({ where: { telefono: numeroTelefono } });
-    delete estadosUsuarios[numeroTelefono];
+    limpiarPedidoPendiente(numeroTelefono);
     await responder("Tu usuario a sido eliminado.");
     return;
   }
@@ -411,50 +1140,17 @@ async function manejarMensaje(
     }
   }
 
-  //Cliente atendido por una persona: el bot se queda callado para no interrumpir
-  //la conversación manual hasta que alguien del equipo lo devuelva al bot desde
-  //el dashboard.
-  if (estadosUsuarios[numeroTelefono] === "HABLANDO_CON_HUMANO") {
-    return;
-  }
-
-  //Si llegó texto en vez de una imagen mientras se esperaba el comprobante (la
-  //imagen en sí se maneja antes de esta función, en messages.upsert, porque
-  //necesita el socket para descargarla). También permite corregir el método de
-  //pago si el cliente eligió "transferencia" por error.
-  if (estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE") {
-    const comando = textoCliente.toLowerCase().trim();
-    if (comando === "cambiar" || comando === "efectivo" || comando === "cambiar metodo" || comando === "cambiar método") {
-      delete metodosPagoPendientes[numeroTelefono];
-      estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
-      await responder(mensajeMetodoPago(modalidadesPendientes[numeroTelefono]));
-      return;
-    }
-    await responder('Por favor envía la *imagen* del comprobante de transferencia (foto o captura de pantalla). Si te equivocaste y quieres pagar en *efectivo*, escribe *cambiar*.');
-    return;
-  }
+  const base: ContextoBase = { numeroTelefono, textoCliente, responder, enviarDatosBancarios, notificarStaff };
 
   try {
-    // 1. ¿ESTAMOS ESPERANDO EL NOMBRE?
-    if (estadosUsuarios[numeroTelefono] === "ESPERANDO_NOMBRE") {
-      const soloLetras = /^[A-Za-zÁÉÍÓÚáéíóúÑñ]+$/;
-
-      if (!soloLetras.test(textoCliente)) {
-        await responder("❌ Formato inválido. Por favor, ingresa *solamente tu primer nombre* (sin espacios, ni números).");
-        return;
-      }
-
-      await Cliente.update(
-        { nombre: textoCliente },
-        { where: { telefono: numeroTelefono } }
-      );
-
-      delete estadosUsuarios[numeroTelefono];
-      await responder(`¡Perfecto, ${textoCliente}! Ya guardé tus datos. 🍔 ¿Qué te gustaría pedir hoy?\n\n1️⃣ Ver Menú\n2️⃣ Hablar con un humano`);
+    const estadoInicial = estadoDe(numeroTelefono);
+    const manejadorSinCliente = estadoInicial && MANEJADORES_SIN_CLIENTE[estadoInicial];
+    if (manejadorSinCliente) {
+      await manejadorSinCliente(base);
       return;
     }
 
-    // 2. BUSCAR/CREAR AL CLIENTE EN LA BD
+    // Buscar/crear al cliente en la BD
     const [cliente, fueCreado] = await Cliente.findOrCreate({
       where: { telefono: numeroTelefono },
       defaults: { telefono: numeroTelefono, nombre: "Por definir" },
@@ -467,553 +1163,20 @@ async function manejarMensaje(
       console.log(`Cliente frecuente Telefono: ${numeroTelefono}`);
     }
 
-    // 2a. ¿ESTAMOS ESPERANDO CONFIRMAR SI QUIERE AGENDAR FUERA DE HORARIO? (ADR-002)
-    if (estadosUsuarios[numeroTelefono] === "ESPERANDO_CONFIRMAR_AGENDA") {
-      const respuesta = textoCliente.toLowerCase();
-      if (respuesta === "si" || respuesta === "sí") {
-        pedidosProgramadosPendientes[numeroTelefono] = true;
-        estadosUsuarios[numeroTelefono] = "ELIGIENDO_CATEGORIA";
-        await responder(await generarListaCategorias());
-        return;
-      }
-      if (respuesta === "no") {
-        delete estadosUsuarios[numeroTelefono];
-        await responder("Sin problema, te esperamos en nuestro horario de atención. ¡Hasta pronto! 👋");
-        return;
-      }
-      await responder("Por favor responde *SI* o *NO*.");
-      return;
-    }
-
-    // 2b. ¿ESTAMOS ESPERANDO LA MODALIDAD DE ENTREGA?
-    // Va justo después de "pagar" y antes del método de pago (ver ADR en el handoff).
-    if (estadosUsuarios[numeroTelefono] === "PIDIENDO_MODALIDAD") {
-      if (textoCliente === "1" || textoCliente === "2") {
-        const modalidad: "delivery" | "retiro" = textoCliente === "1" ? "delivery" : "retiro";
-        modalidadesPendientes[numeroTelefono] = modalidad;
-        const prefijo = modalidad === "retiro" ? `📍 Retiras en nuestro local: ${DIRECCION_LOCAL}\n\n` : "";
-
-        // Pedido agendado (ver ADR-002): en vez de ir directo al método de pago,
-        // pregunta la hora dentro de los turnos que quedan hoy.
-        if (pedidosProgramadosPendientes[numeroTelefono]) {
-          const franjas = await calcularFranjasDisponibles(configuracionBot.duracionFranjaMin, configuracionBot.capacidadPorFranja);
-          if (franjas.length === 0) {
-            // Se llenaron los horarios mientras elegía la modalidad (raro, pero posible).
-            delete pedidosProgramadosPendientes[numeroTelefono];
-            estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
-            await responder(`${prefijo}Se acaban de llenar los horarios disponibles para agendar hoy.\n\n${mensajeMetodoPago(modalidad)}`);
-            return;
-          }
-          franjasPendientes[numeroTelefono] = franjas;
-          estadosUsuarios[numeroTelefono] = "ELIGIENDO_HORA_PROGRAMADA";
-          const lista = franjas.map((f, i) => `${numeroEmoji(i + 1)} ${f.inicio}-${f.fin}`).join("\n");
-          await responder(`${prefijo}🗓️ ¿Para qué hora lo necesitas?\n\n${lista}`);
-          return;
-        }
-
-        estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
-        await responder(`${prefijo}${mensajeMetodoPago(modalidad)}`);
-        return;
-      }
-      await responder("Por favor responde *1* para Delivery o *2* para Retiro en el local.");
-      return;
-    }
-
-    // 2c. ¿ESTAMOS ELIGIENDO LA HORA DE UN PEDIDO AGENDADO? (ver ADR-002)
-    if (estadosUsuarios[numeroTelefono] === "ELIGIENDO_HORA_PROGRAMADA") {
-      const franjas = franjasPendientes[numeroTelefono] ?? [];
-      const elegida = franjas[Number(textoCliente) - 1];
-      if (!elegida) {
-        await responder("Por favor elige un número válido de la lista de horarios.");
-        return;
-      }
-      horaProgramadaPendientes[numeroTelefono] = horaChileAFecha(elegida.inicio);
-      estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
-      await responder(mensajeMetodoPago(modalidadesPendientes[numeroTelefono]));
-      return;
-    }
-
-    // 2d. ¿ESTAMOS ELIGIENDO CATEGORÍA DEL MENÚ?
-    if (estadosUsuarios[numeroTelefono] === "ELIGIENDO_CATEGORIA") {
-      if (textoCliente === "0") {
-        const { texto, codigos } = await generarMenuCategoria(null);
-        menuActualPendiente[numeroTelefono] = codigos;
-        estadosUsuarios[numeroTelefono] = "REALIZANDO_PEDIDO";
-        await responder(texto);
-        return;
-      }
-      const categorias = await Categoria.findAll({ order: [["orden", "ASC"]] });
-      const categoria = categorias[Number(textoCliente) - 1];
-      if (!categoria) {
-        await responder('Por favor elige un número válido de categoría, o *0* para ver todo el menú.');
-        return;
-      }
-      const { texto, codigos } = await generarMenuCategoria(categoria.id);
-      menuActualPendiente[numeroTelefono] = codigos;
-      estadosUsuarios[numeroTelefono] = "REALIZANDO_PEDIDO";
-      await responder(texto);
-      return;
-    }
-
-    // 3a0. ¿ESTAMOS ESPERANDO EL MÉTODO DE PAGO?
-    if (estadosUsuarios[numeroTelefono] === "PIDIENDO_METODO_PAGO") {
-      if (textoCliente === "1") {
-        metodosPagoPendientes[numeroTelefono] = "efectivo";
-        estadosUsuarios[numeroTelefono] = "PIDIENDO_MONTO_EFECTIVO";
-        const { total } = formatResumenCarrito(carritos[numeroTelefono] ?? [], "");
-        await responder(`💵 Tu pedido suma *$${total.toLocaleString("es-CL")}*. ¿Con qué billete vas a pagar, para llevarte el vuelto justo? (escribe solo el monto, ej: 10000)`);
-        return;
-      }
-      if (textoCliente === "2") {
-        metodosPagoPendientes[numeroTelefono] = "transferencia";
-        estadosUsuarios[numeroTelefono] = "ESPERANDO_COMPROBANTE";
-        await enviarDatosBancarios();
-        await responder("📸 Envía la *imagen* de tu comprobante de transferencia (foto o captura de pantalla).");
-        return;
-      }
-      await responder("Por favor responde *1* para Efectivo o *2* para Transferencia.");
-      return;
-    }
-
-    // 3a-bis. ¿ESTAMOS ESPERANDO EL MONTO CON QUE PAGA EN EFECTIVO?
-    if (estadosUsuarios[numeroTelefono] === "PIDIENDO_MONTO_EFECTIVO") {
-      const comandoCambiar = textoCliente.toLowerCase().trim();
-      if (comandoCambiar === "cambiar" || comandoCambiar === "transferencia" || comandoCambiar === "cambiar metodo" || comandoCambiar === "cambiar método") {
-        delete metodosPagoPendientes[numeroTelefono];
-        estadosUsuarios[numeroTelefono] = "PIDIENDO_METODO_PAGO";
-        await responder(mensajeMetodoPago(modalidadesPendientes[numeroTelefono]));
-        return;
-      }
-      const monto = Number(textoCliente.replace(/[^\d]/g, ""));
-      if (!monto) {
-        await responder("Por favor escribe solo el monto en números, ej: 10000. Si te equivocaste y quieres pagar por *transferencia*, escribe *cambiar*.");
-        return;
-      }
-      const { total } = formatResumenCarrito(carritos[numeroTelefono] ?? [], "");
-      if (monto < total) {
-        await responder(`Ese monto no alcanza a cubrir el total ($${total.toLocaleString("es-CL")}). Escribe un monto igual o mayor.`);
-        return;
-      }
-      montosRecibidosPendientes[numeroTelefono] = monto;
-
-      if (modalidadesPendientes[numeroTelefono] === "delivery") {
-        estadosUsuarios[numeroTelefono] = "PIDIENDO_DIRECCION";
-        await responder("📍 Pásame tu dirección de entrega (calle, número, comuna).");
-      } else {
-        estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
-        await responder("📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
-      }
-      return;
-    }
-
-    // 3a-ter. ¿ESTAMOS ESPERANDO LA DIRECCIÓN DE DESPACHO? (solo delivery)
-    if (estadosUsuarios[numeroTelefono] === "PIDIENDO_DIRECCION") {
-      direccionesPendientes[numeroTelefono] = textoCliente;
-      estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
-      await responder("📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
-      return;
-    }
-
-    // 3a. ¿ESTAMOS ESPERANDO LA NOTA DE ALERGIAS/INSTRUCCIONES ESPECIALES?
-    if (estadosUsuarios[numeroTelefono] === "PIDIENDO_NOTA") {
-      const nota = textoCliente.toLowerCase() === "no" ? "" : textoCliente;
-      notasPendientes[numeroTelefono] = nota;
-      estadosUsuarios[numeroTelefono] = "CONFIRMANDO_PEDIDO";
-
-      const miCarrito = carritos[numeroTelefono] ?? [];
-      const horaProgramadaPreview = horaProgramadaPendientes[numeroTelefono];
-      const { texto } = formatResumenCarrito(miCarrito, nota, {
-        metodoPago: metodosPagoPendientes[numeroTelefono],
-        modalidad: modalidadesPendientes[numeroTelefono],
-        direccion: direccionesPendientes[numeroTelefono],
-        montoRecibido: montosRecibidosPendientes[numeroTelefono],
-        horaProgramadaTexto: horaProgramadaPreview ? formatHoraChile(horaProgramadaPreview) : undefined,
-      });
-      await responder(`*🧾 REVISA TU PEDIDO ANTES DE ENVIARLO:*\n\n${texto}\n\n¿Confirmas? Responde *SI* para mandarlo a cocina o *NO* para seguir editando.`);
-      return;
-    }
-
-    // 3b. ¿ESTAMOS ESPERANDO LA CONFIRMACIÓN FINAL?
-    // Existe para evitar pedidos "fantasma": nada se guarda en la cocina hasta
-    // que el cliente confirma explícitamente con SI.
-    if (estadosUsuarios[numeroTelefono] === "CONFIRMANDO_PEDIDO") {
-      const respuesta = textoCliente.toLowerCase();
-
-      if (respuesta === "no") {
-        estadosUsuarios[numeroTelefono] = "REALIZANDO_PEDIDO";
-        // OJO: metodoPago/comprobante/modalidad/dirección/monto NO se borran acá.
-        // "NO" significa "déjame seguir agregando platos" (es literal lo que dice
-        // el mensaje de abajo) — esa información ya la dio el cliente y sigue
-        // siendo válida. Borrarla obligaba a mandar el comprobante de transferencia
-        // una segunda vez al volver a escribir "pagar" (bug reportado por el cliente
-        // real: ver el chequeo de "ya resuelto" en el handler de "pagar" más abajo).
-        // OJO: pedidosProgramadosPendientes NO se borra acá — si seguía cerrado
-        // cuando confirmó "no", al volver a escribir "pagar" debe recalcular
-        // franjas y volver a pedir la hora, no colarse como pedido en tiempo
-        // real (ver ADR-002). Solo se limpia lo que hay que recalcular de cero.
-        delete franjasPendientes[numeroTelefono];
-        delete horaProgramadaPendientes[numeroTelefono];
-        await responder("Sin problema, sigue agregando platos o escribe *pagar* cuando estés listo.");
-        return;
-      }
-
-      if (respuesta !== "si" && respuesta !== "sí") {
-        await responder("Por favor responde *SI* para confirmar tu pedido o *NO* para seguir editando.");
-        return;
-      }
-
-      const miCarrito = carritos[numeroTelefono];
-      if (!miCarrito || miCarrito.length === 0) {
-        estadosUsuarios[numeroTelefono] = "REALIZANDO_PEDIDO";
-        await responder("Tu carrito quedó vacío, escribe un código válido (ej: 11) para agregar algo.");
-        return;
-      }
-
-      const nota = notasPendientes[numeroTelefono] ?? "";
-      const metodoPago = metodosPagoPendientes[numeroTelefono];
-      const comprobanteImagen = comprobantesPendientes[numeroTelefono] ?? null;
-      const modalidad = modalidadesPendientes[numeroTelefono] ?? null;
-      const direccion = direccionesPendientes[numeroTelefono] ?? null;
-      const montoRecibido = montosRecibidosPendientes[numeroTelefono] ?? null;
-      const horaProgramada = horaProgramadaPendientes[numeroTelefono] ?? null;
-
-      // Revalidación final de la hora agendada (ver ADR-002): la disponibilidad
-      // se chequeó una sola vez, cuando se mostró la lista de horarios, varios
-      // mensajes atrás (modalidad → hora → método de pago → comprobante/monto →
-      // nota → confirmar). Si otro cliente reservó esa misma franja mientras
-      // tanto, sin este chequeo el pedido se creaba igual, duplicando la hora
-      // (bug real reportado: dos pedidos para las 9:30). Se revisa recién acá,
-      // justo antes de guardar, contra el estado actual de la BD.
-      if (horaProgramada) {
-        const finFranja = new Date(horaProgramada.getTime() + configuracionBot.duracionFranjaMin * 60000);
-        const ocupados = await Pedido.count({
-          where: {
-            horaProgramada: { [Op.gte]: horaProgramada, [Op.lt]: finFranja },
-            estado: { [Op.ne]: "cancelado" },
-          },
-        });
-        if (ocupados >= configuracionBot.capacidadPorFranja) {
-          const franjas = await calcularFranjasDisponibles(configuracionBot.duracionFranjaMin, configuracionBot.capacidadPorFranja);
-          delete horaProgramadaPendientes[numeroTelefono];
-          if (franjas.length === 0) {
-            delete pedidosProgramadosPendientes[numeroTelefono];
-            delete franjasPendientes[numeroTelefono];
-            estadosUsuarios[numeroTelefono] = "CONFIRMANDO_PEDIDO";
-            await responder("😕 Justo se acaba de ocupar ese horario y no quedan más disponibles por hoy. Escribe *SI* para mandarlo en tiempo real apenas abramos, o *NO* para seguir editando.");
-            return;
-          }
-          franjasPendientes[numeroTelefono] = franjas;
-          estadosUsuarios[numeroTelefono] = "ELIGIENDO_HORA_PROGRAMADA";
-          const lista = franjas.map((f, i) => `${numeroEmoji(i + 1)} ${f.inicio}-${f.fin}`).join("\n");
-          await responder(`😕 Justo se acaba de ocupar ese horario. Elige otro:\n\n${lista}`);
-          return;
-        }
-      }
-
-      const { texto: resumenItems, total } = formatResumenCarrito(miCarrito, nota, {
-        metodoPago,
-        modalidad: modalidad ?? undefined,
-        direccion: direccion ?? undefined,
-        montoRecibido: montoRecibido ?? undefined,
-        horaProgramadaTexto: horaProgramada ? formatHoraChile(horaProgramada) : undefined,
-      });
-      // Un pedido agendado ya tiene una hora comprometida — no tiene sentido
-      // mostrarle además un rango de espera "en vivo" (ver ADR-002).
-      const tiempoEstimado = horaProgramada ? null : await calcularTiempoEstimado(miCarrito);
-      const lineaTiempo = horaProgramada
-        ? `🗓️ Tu pedido quedó agendado para las ${formatHoraChile(horaProgramada)}.`
-        : `⏱️ Tiempo estimado: ${tiempoEstimado!.min}-${tiempoEstimado!.max} min`;
-      const resumen = `*🧾 RESUMEN DE TU PEDIDO:*\n\n${resumenItems}\n${lineaTiempo}\n\n¡Tu pedido ha sido confirmado! 🧑‍🍳 En breve te contactaremos para coordinar el pago y la entrega.`;
-
-      // ============ PERSISTENCIA EN BD ============
-      // Guarda el pedido y sus detalles para que sobreviva a un reinicio del bot
-      // y quede disponible aunque ningún dashboard esté conectado al emitirse.
-      let pedidoId: string = `pedido_${Date.now()}`;
-      //Cuántos pedidos anteriores de este cliente quedaron marcados "cancelado"
-      //(el equipo los usa para marcar "no llegó" desde el dashboard). Se avisa al
-      //equipo en el mismo pedido nuevo para que decidan si piden algo extra de
-      //garantía antes de empezar a cocinar.
-      let noShows = 0;
-      try {
-        // Diagnóstico: se detectaron pedidos guardados con cliente_id NULL (el
-        // teléfono no aparece en el dashboard) sin poder reproducir la causa por
-        // lectura de código — si vuelve a pasar, este log debería decir por qué
-        // `cliente` llegó roto hasta acá.
-        if (!cliente?.id) {
-          console.error("[BUG cliente_id] cliente inválido al crear el pedido:", { numeroTelefono, cliente, fueCreado });
-        }
-
-        noShows = await Pedido.count({ where: { cliente_id: cliente.id, estado: "cancelado" } });
-
-        const nuevoPedido = await Pedido.create({
-          cliente_id: cliente.id,
-          estado: "pendiente",
-          total,
-          notas: nota || null,
-          metodoPago: metodoPago ?? null,
-          comprobanteImagen,
-          modalidad,
-          direccion,
-          montoRecibido,
-          tiempoEstimadoMin: tiempoEstimado?.min ?? null,
-          tiempoEstimadoMax: tiempoEstimado?.max ?? null,
-          horaProgramada,
-        });
-        pedidoId = nuevoPedido.id;
-
-        // Los items ya vienen con productoId real (elegidos del menú por categorías,
-        // ver ELIGIENDO_CATEGORIA) — ya no hace falta buscar/crear por nombre.
-        for (const item of miCarrito) {
-          await DetallePedido.create({
-            pedido_id: nuevoPedido.id,
-            producto_id: item.productoId,
-            cantidad: 1,
-            precio_unitario: item.precio,
-          });
-        }
-      } catch (dbErr) {
-        // No rompemos el flujo del cliente si la DB falla, pero queda registrado
-        console.error("[DB] No se pudo persistir el pedido:", dbErr);
-      }
-      // ===============================================================
-
-      // ============ EMITIR EVENTO SOCKET.IO: nuevo_pedido ============
-      // IMPORTANTE: Esta es la integración pedida. El Dashboard recibe tiempo real.
-      try {
-        const { getIO } = await import("../config/socket.js");
-        const io = getIO();
-
-        const pedidoPayload = {
-          id: pedidoId,
-          cliente: {
-            telefono: numeroTelefono,
-            nombre: cliente.nombre,
-            whatsapp: `${numeroTelefono}@s.whatsapp.net`,
-          },
-          items: [...miCarrito],
-          total,
-          resumen: nota,
-          metodoPago: metodoPago ?? null,
-          comprobanteImagen,
-          clienteNoShows: noShows,
-          modalidad,
-          direccion,
-          montoRecibido,
-          tiempoEstimadoMin: tiempoEstimado?.min ?? null,
-          tiempoEstimadoMax: tiempoEstimado?.max ?? null,
-          horaProgramada: horaProgramada ? horaProgramada.toISOString() : null,
-          fecha: new Date().toISOString(),
-        };
-
-        // Un pedido agendado no debe aparecer en el feed de "activos ahora" del
-        // dashboard (la cocina no debe empezarlo antes de tiempo) — va a su propia
-        // sección, alimentada por este evento distinto (ver GET /api/pedidos/programados).
-        const evento = horaProgramada ? "nuevo_pedido_programado" : "nuevo_pedido";
-        io.emit(evento, pedidoPayload);
-
-        console.log(`[Socket.IO] Evento '${evento}' emitido para ${numeroTelefono} total $${total.toLocaleString("es-CL")}`);
-      } catch (socketErr) {
-        // No romper el flujo del pedido si Socket.IO aún no está listo
-        // En producción podrías persistir en DB y hacer polling fallback
-        const message = socketErr instanceof Error ? socketErr.message : String(socketErr);
-        console.warn("[Socket.IO] No se pudo emitir nuevo_pedido:", message);
-      }
-      // ===============================================================
-
-      // ============ AVISO ADICIONAL POR WHATSAPP (opcional) ============
-      // Parche para cuando el sonido del dashboard no es confiable (celular
-      // bloqueado): un WhatsApp corto al número de turno, además del evento de
-      // socket de arriba — no lo reemplaza, solo funciona como alarma.
-      if (configuracionBot.notificacionesWhatsappActivas && configuracionBot.numeroNotificaciones) {
-        const avisoModalidad = horaProgramada
-          ? `🗓️ agendado ${formatHoraChile(horaProgramada)}`
-          : modalidad === "retiro"
-            ? "🏪 retiro en local"
-            : "🛵 delivery";
-        console.log(`[WhatsApp] Enviando aviso de pedido nuevo a ${configuracionBot.numeroNotificaciones}...`);
-        await notificarStaff(
-          `🔔 *Pedido nuevo* — ${cliente.nombre}\n${miCarrito.length} plato(s) · $${total.toLocaleString("es-CL")} · ${avisoModalidad}\n\nRevisa el dashboard para los detalles.`
-        );
-        console.log("[WhatsApp] Aviso de pedido nuevo enviado sin errores.");
-      } else {
-        // Diagnóstico: si esto aparece, el aviso no se manda porque la caché en
-        // memoria no ve el toggle activado o el número — aunque la DB lo tenga
-        // guardado bien, puede que este proceso arrancó antes de guardarlo, o que
-        // cargarConfiguracionBot() falló al arrancar (ver warning más arriba).
-        console.log(
-          `[WhatsApp] Aviso de pedido nuevo NO enviado — notificacionesWhatsappActivas=${configuracionBot.notificacionesWhatsappActivas}, numeroNotificaciones=${configuracionBot.numeroNotificaciones ?? "null"}`
-        );
-      }
-      // ===============================================================
-
-      // Limpieza de memoria
-      delete estadosUsuarios[numeroTelefono];
-      delete carritos[numeroTelefono];
-      delete notasPendientes[numeroTelefono];
-      delete metodosPagoPendientes[numeroTelefono];
-      delete comprobantesPendientes[numeroTelefono];
-      delete modalidadesPendientes[numeroTelefono];
-      delete direccionesPendientes[numeroTelefono];
-      delete montosRecibidosPendientes[numeroTelefono];
-      delete pedidosProgramadosPendientes[numeroTelefono];
-      delete franjasPendientes[numeroTelefono];
-      delete horaProgramadaPendientes[numeroTelefono];
-      delete menuActualPendiente[numeroTelefono];
-
-      await responder(resumen);
-      return;
-    }
-
-    // 3. LÓGICA DEL SALUDO y de preguntas de "¿están abiertos/atendiendo/disponibles?".
-    // Ninguna de las dos debe interrumpir un pedido ya en curso.
-    if (estadosUsuarios[numeroTelefono] !== "REALIZANDO_PEDIDO" && esConsultaEstado(textoCliente)) {
-      await mostrarMenuOAgendar(numeroTelefono, responder, "✅ ¡Sí, estamos atendiendo! 🇵🇪\n\n");
-      return;
-    }
-
-    // No intentamos reconocer cada variante de "hola" (wena, wenas, wenos días,
-    // holaaaa, ola, etc. — son infinitas). En este punto del flujo el estado solo
-    // puede ser "sin pedido activo" o REALIZANDO_PEDIDO (todo estado intermedio ya
-    // hizo return más arriba), y los únicos comandos válidos en estado idle son
-    // "1" y "2" (enrutador principal, abajo). Cualquier otro texto de un cliente
-    // idle no tiene otro significado posible que "está iniciando la conversación",
-    // así que la bienvenida es la respuesta por defecto — no un saludo detectado.
-    if (
-      estadosUsuarios[numeroTelefono] !== "REALIZANDO_PEDIDO" &&
-      textoCliente !== "1" &&
-      textoCliente !== "2"
-    ) {
-      if (fueCreado || !cliente.nombre || cliente.nombre.trim() === "Por definir") {
-        estadosUsuarios[numeroTelefono] = "ESPERANDO_NOMBRE";
-        await responder("¡Hola! Soy el asistente virtual de UrbanPerú 🇵🇪. Veo que es tu primera vez pidiendo con nosotros. ¿Me podrías decir tu nombre para registrarte?");
-      } else {
-        await responder(`¡Hola de nuevo, ${cliente.nombre}! 🇵🇪 ¿Qué vas a servirte hoy?\n\n1️⃣ Ver Menú\n2️⃣ Hablar con un humano`);
-      }
-      return;
-    }
-
-    // 4. ENRUTADOR PRINCIPAL (OPCIÓN 1 y 2)
-    // Solo respondemos al 1 y 2 si NO están dentro de un pedido
-    if (textoCliente === "1" && estadosUsuarios[numeroTelefono] !== "REALIZANDO_PEDIDO") {
-      await mostrarMenuOAgendar(numeroTelefono, responder);
-      return;
-    }
-
-    if (textoCliente === "2" && estadosUsuarios[numeroTelefono] !== "REALIZANDO_PEDIDO") {
-      estadosUsuarios[numeroTelefono] = "HABLANDO_CON_HUMANO";
-      delete carritos[numeroTelefono];
-
-      const desde = new Date();
-      await Cliente.update({ necesitaHumanoDesde: desde }, { where: { telefono: numeroTelefono } });
-
-      void emitirEvento("cliente_necesita_humano", {
-        telefono: numeroTelefono,
-        nombre: cliente.nombre,
-        desde: desde.toISOString(),
-      });
-
-      await responder("👨‍🍳 ¡Entendido! Un miembro de nuestro equipo leerá tu mensaje y te atenderá en unos minutos. ¡Gracias por tu paciencia!");
-      return;
-    }
-
-    // 5. LÓGICA DEL CARRITO (SOLO si el estado es REALIZANDO_PEDIDO)
-    if (estadosUsuarios[numeroTelefono] === "REALIZANDO_PEDIDO") {
-      // a) Si el cliente quiere pagar: pasa a pedir nota + confirmación antes de
-      // crear nada en firme (ver estados PIDIENDO_METODO_PAGO / PIDIENDO_NOTA /
-      // CONFIRMANDO_PEDIDO arriba).
-      if (textoCliente.toLowerCase() === "pagar") {
-        const miCarrito = carritos[numeroTelefono];
-
-        if (!miCarrito || miCarrito.length === 0) {
-          await responder("Tu carrito está vacío. Por favor escribe un código válido (ej: 11).");
-          return;
-        }
-
-        // ¿Ya resolvió modalidad + pago en un intento anterior (dijo "no" solo
-        // para agregar más platos)? Si sigue siendo válido, no tiene sentido
-        // volver a pedir la modalidad, el método de pago ni el comprobante —
-        // se salta directo a la nota con el carrito actualizado.
-        const modalidad = modalidadesPendientes[numeroTelefono];
-        const metodoPago = metodosPagoPendientes[numeroTelefono];
-        const direccionResuelta = !modalidad || modalidad === "retiro" || !!direccionesPendientes[numeroTelefono];
-        const { total: totalActual } = formatResumenCarrito(miCarrito, "");
-        const pagoResuelto =
-          metodoPago === "transferencia" ? !!comprobantesPendientes[numeroTelefono] :
-            metodoPago === "efectivo" ? (montosRecibidosPendientes[numeroTelefono] ?? 0) >= totalActual :
-              false;
-        // Si es un pedido agendado, la hora elegida también se borró al decir "no"
-        // (ver ADR-002 — puede haber pasado tiempo y las franjas ya no ser las
-        // mismas), así que si falta hay que volver a pedirla, no saltarla.
-        const horaResuelta = !pedidosProgramadosPendientes[numeroTelefono] || !!horaProgramadaPendientes[numeroTelefono];
-
-        if (modalidad && metodoPago && pagoResuelto && direccionResuelta && horaResuelta) {
-          estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
-          await responder("📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
-          return;
-        }
-
-        estadosUsuarios[numeroTelefono] = "PIDIENDO_MODALIDAD";
-        await responder("🛵 ¿Tu pedido es para *delivery* o *retiro* en el local?\n\n1️⃣ Delivery\n2️⃣ Retiro en el local");
-        return;
-      }
-
-      // b) Si el cliente quiere ver las categorías de nuevo (para seguir agregando
-      // platos de otra categoría al mismo pedido, ver ELIGIENDO_CATEGORIA).
-      if (textoCliente.toLowerCase() === "listo") {
-        estadosUsuarios[numeroTelefono] = "ELIGIENDO_CATEGORIA";
-        await responder(await generarListaCategorias());
-        return;
-      }
-
-      // c-bis) Ver el carrito o corregir un plato agregado por error (ver el mismo
-      // pedido del owner que dio origen al "cambiar" de método de pago).
-      if (textoCliente.toLowerCase() === "carrito") {
-        const miCarrito = carritos[numeroTelefono] ?? [];
-        if (miCarrito.length === 0) {
-          await responder("Tu carrito está vacío todavía. Escribe un código del menú para agregar un plato.");
-          return;
-        }
-        const lineas = miCarrito.map((item, i) => `${numeroEmoji(i + 1)} ${item.nombre} - $${item.precio.toLocaleString("es-CL")}`);
-        await responder(`🛒 *Tu pedido hasta ahora:*\n\n${lineas.join("\n")}\n\n👉 Escribe *quitar <número>* para eliminar un plato (ej: quitar 2), o sigue agregando códigos.`);
-        return;
-      }
-
-      const matchQuitar = textoCliente.toLowerCase().trim().match(/^quitar(?:\s+(\d+))?$/);
-      if (matchQuitar) {
-        const miCarrito = carritos[numeroTelefono] ?? [];
-        if (miCarrito.length === 0) {
-          await responder("Tu carrito ya está vacío, no hay nada que quitar.");
-          return;
-        }
-        // "quitar" sin número saca el último plato agregado (el caso típico de
-        // "me equivoqué de código"); "quitar N" saca uno específico de la lista
-        // mostrada con *carrito*.
-        const posicion = matchQuitar[1] ? Number(matchQuitar[1]) : miCarrito.length;
-        const indice = posicion - 1;
-        if (indice < 0 || indice >= miCarrito.length) {
-          await responder("No encontré ese número en tu carrito. Escribe *carrito* para ver la lista actualizada.");
-          return;
-        }
-        const [eliminado] = miCarrito.splice(indice, 1);
-        await responder(`🗑️ Quité *${eliminado.nombre}* de tu pedido.\n\n👉 Escribe *carrito* para ver lo que queda, otro código para seguir agregando, o *pagar* cuando estés listo.`);
-        return;
-      }
-
-      // d) Si el cliente ingresa un plato (código del último listado mostrado)
-      const productoElegido = menuActualPendiente[numeroTelefono]?.[textoCliente];
-
-      if (productoElegido) {
-        if (!carritos[numeroTelefono]) {
-          carritos[numeroTelefono] = [];
-        }
-        carritos[numeroTelefono].push(productoElegido);
-        await responder(`✅ *${productoElegido.nombre}* agregado a tu pedido.\n\n👉 Escribe otro código para seguir en esta categoría. \n✅ *listo* para ver las categorías de nuevo\n 🛒*carrito* para revisar/quitar algo\n 💰*pagar* para enviar tu pedido a la cocina.`);
-      } else {
-        await responder('❌ Código no reconocido. Escribe un número válido del listado, ✅*listo* para ver las categorías, 🛒*carrito* para revisar/quitar algo.💰*pagar* para enviar tu pedido a la cocina.');
-      }
-    }
+    // El estado se vuelve a leer acá, después del `await` de arriba: otro mensaje
+    // del mismo cliente pudo haberlo cambiado mientras se buscaba al cliente.
+    const ctx: ContextoMensaje = { ...base, cliente, fueCreado };
+    const estadoActual = estadoDe(numeroTelefono);
+    const manejador = (estadoActual && MANEJADORES[estadoActual]) || manejarSinPedidoActivo;
+    await manejador(ctx);
   } catch (error) {
     console.error("Error al intentar interactuar con la db", error);
+    // Si falló a mitad de guardar el pedido, sin esto el cliente quedaba trabado
+    // en PROCESANDO_PEDIDO (candado de manejarProcesandoPedido) sin poder reintentar.
+    if (estadoDe(numeroTelefono) === "PROCESANDO_PEDIDO") {
+      pedido(numeroTelefono).estado = "CONFIRMANDO_PEDIDO";
+      await Promise.resolve(responder("⚠️ Tuve un problema al guardar tu pedido. Responde *SI* para intentarlo de nuevo.")).catch(() => {});
+    }
   }
 }
 
@@ -1040,13 +1203,13 @@ export async function manejarMensajeEntrante(opts: {
   }
 
   //Comprobante de transferencia: no pasa por el flujo de solo-texto de abajo.
-  if (estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE" && imagen) {
-    comprobantesPendientes[numeroTelefono] = `data:${imagen.mimetype};base64,${imagen.buffer.toString("base64")}`;
-    if (modalidadesPendientes[numeroTelefono] === "delivery") {
-      estadosUsuarios[numeroTelefono] = "PIDIENDO_DIRECCION";
+  if (estadoDe(numeroTelefono) === "ESPERANDO_COMPROBANTE" && imagen) {
+    pedido(numeroTelefono).comprobanteImagen = `data:${imagen.mimetype};base64,${imagen.buffer.toString("base64")}`;
+    if (pedido(numeroTelefono).modalidad === "delivery") {
+      pedido(numeroTelefono).estado = "PIDIENDO_DIRECCION";
       await responder("✅ Comprobante recibido.\n\n📍 Pásame tu dirección de entrega (calle, número, comuna).");
     } else {
-      estadosUsuarios[numeroTelefono] = "PIDIENDO_NOTA";
+      pedido(numeroTelefono).estado = "PIDIENDO_NOTA";
       await responder("✅ Comprobante recibido.\n\n📝 ¿Alguna alergia o instrucción especial para tu pedido? (ej: alérgico a los mariscos, sin cebolla, para llevar, etc.)\n\nEscribe tu nota, o *no* si no tienes ninguna.");
     }
     return;
@@ -1056,7 +1219,7 @@ export async function manejarMensajeEntrante(opts: {
   //sincronización multimedia: imágenes, stickers, etc.) — salvo que estuviera
   //esperando el comprobante, donde vale la pena avisarle que mande la imagen.
   if (!texto || texto.trim() === "") {
-    if (estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE") {
+    if (estadoDe(numeroTelefono) === "ESPERANDO_COMPROBANTE") {
       await responder("Por favor envía la *imagen* del comprobante de transferencia (foto o captura de pantalla).");
     }
     return;
@@ -1069,7 +1232,7 @@ export async function manejarMensajeEntrante(opts: {
 //descargar una imagen entrante ANTES de gastar la llamada a la API — solo se
 //necesita cuando el cliente está esperando el comprobante de transferencia.
 export function estaEsperandoComprobante(numeroTelefono: string): boolean {
-  return estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE";
+  return estadoDe(numeroTelefono) === "ESPERANDO_COMPROBANTE";
 }
 
 function extraerTexto(msg: WAMessage): string | undefined {
@@ -1092,7 +1255,7 @@ async function emitirEvento(evento: string, payload?: unknown): Promise<void> {
 //Usado por PATCH /api/clientes/:telefono/reanudar-bot cuando el equipo termina de
 //atender manualmente y quiere que el bot vuelva a responder ese número.
 export function reanudarBot(numeroTelefono: string): void {
-  delete estadosUsuarios[numeroTelefono];
+  delete pedidosPendientes[numeroTelefono]?.estado;
 }
 
 //Último QR generado y todavía sin escanear (null si ya está vinculado). El evento
@@ -1291,7 +1454,7 @@ export async function iniciarWhatsapp(): Promise<void> {
         //conversación no vale la pena descargarla, se va a ignorar igual.
         let imagen: { buffer: Buffer; mimetype: string } | null = null;
         const imagenMsg = msg.message?.imageMessage;
-        if (imagenMsg && estadosUsuarios[numeroTelefono] === "ESPERANDO_COMPROBANTE") {
+        if (imagenMsg && estadoDe(numeroTelefono) === "ESPERANDO_COMPROBANTE") {
           try {
             const buffer = await downloadMediaMessage(msg, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage });
             imagen = { buffer, mimetype: imagenMsg.mimetype || "image/jpeg" };
@@ -1311,7 +1474,14 @@ export async function iniciarWhatsapp(): Promise<void> {
           enviarDatosBancarios,
           notificarStaff,
         });
-      })();
+      })().catch((e) => {
+        // Sin este .catch, cualquier error acá (ej. un hipo de Postgres justo
+        // durante "reset", que corre antes del try/catch de manejarMensaje)
+        // era una promesa rechazada sin nadie que la atrape — Node mata el
+        // proceso completo por eso desde la v15, tumbando el bot para TODOS
+        // los clientes por un error de UN solo mensaje.
+        console.error("[WhatsApp] Error no manejado procesando un mensaje:", e);
+      });
     }
   });
 }
