@@ -3,6 +3,7 @@ import type { Socket } from 'socket.io-client'
 import type { Order } from '../types/order'
 import { getSocket, disconnectSocket } from '../services/socket'
 import { playNotificationSound } from '../utils/audio'
+import { EVENTO_REFRESCAR_PEDIDOS } from '../utils/refrescar'
 import { getPedidosActivos, marcarPedidoEntregado, marcarPedidoNoLlego, marcarPedidoCancelado } from '../services/api'
 
 export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
@@ -10,8 +11,8 @@ export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
   const [connectionState, setConnectionState] = useState<'connecting' | 'connected' | 'disconnected' | 'error'>('disconnected')
   const [lastOrder, setLastOrder] = useState<Order | null>(null)
   // IDs que se sacaron de la lista de forma optimista (botón "Listo"/"No
-  // llegó"/"Cancelar") pero cuyo PATCH todavía no confirma en el backend. El
-  // poll de 60s (más abajo) los ignora mientras estén acá — si no, un GET que
+  // llegó"/"Cancelar") pero cuyo PATCH todavía no confirma en el backend. Los
+  // refrescos de más abajo los ignoran mientras estén acá — si no, un GET que
   // ya estaba en vuelo cuando se tocó el botón podía volver a agregar el
   // pedido que el staff recién sacó, porque en la BD todavía figuraba activo.
   const pendingRemovals = useRef<Set<string>>(new Set())
@@ -54,7 +55,7 @@ export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
     }
     // Otro dashboard (u otra pestaña) marcó un pedido como entregado/cancelado
     // vía PATCH — sin escuchar esto, este dashboard solo se enteraba al
-    // siguiente poll de 60s o al recargar la página.
+    // volver a pedir los pedidos o al recargar la página.
     const onPedidoActualizado = (payload: { id: string; estado: string }) => {
       if (payload.estado === 'entregado' || payload.estado === 'cancelado') {
         setOrders((prev) => prev.filter((o) => String(o.id) !== String(payload.id)))
@@ -81,13 +82,14 @@ export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
     }
   }, [token, addOrder])
 
-  // Recupera los pedidos activos guardados en BD al montar (o si cambia el token):
-  // sin esto, recargar la página (ej. el celular descarga la pestaña en segundo
-  // plano) deja el dashboard vacío hasta que llegue un pedido nuevo por socket.
-  // Se repite cada 60s (no solo al montar): un pedido agendado (ver ADR-002) no
-  // dispara ningún evento de socket cuando llega su hora — sin este refresco se
-  // quedaba atascado en "Pedidos programados", sin botón "Listo", hasta que
-  // alguien recargara la página a mano.
+  // Recupera los pedidos activos guardados en BD: al montar (recargar la página
+  // dejaría el dashboard vacío hasta el próximo pedido por socket) y después SOLO
+  // ante eventos reales — reconexión del socket, volver a la pestaña, recuperar
+  // internet, o el aviso de que llegó la hora de un pedido agendado. Antes se
+  // repetía cada 60 s por reloj: con una pestaña abierta (el turno mantiene la
+  // pantalla encendida) la base de Neon nunca llegaba a suspenderse y agotó el
+  // cupo mensual de cómputo del plan gratis. Los pedidos nuevos ya llegan por
+  // Socket.IO; este GET es solo la red de seguridad para lo que se haya perdido.
   useEffect(() => {
     if (!token) return
     let cancelado = false
@@ -105,9 +107,33 @@ export function useOrdersSocket(token: string | null, audioUnlocked: boolean) {
         })
         .catch((e) => console.warn('[Pedidos] No se pudieron cargar pedidos activos:', e))
     }
+    // Los eventos suelen llegar en ráfaga al abrir la página (conexión del socket,
+    // foco de la pestaña…): si ya se cargó hace un instante no vale la pena repetir.
+    let ultimaCargaEn = 0
+    const cargarSiHaceFalta = () => {
+      if (Date.now() - ultimaCargaEn < 3000) return
+      ultimaCargaEn = Date.now()
+      cargar()
+    }
+    const alVolverALaPestana = () => {
+      if (document.visibilityState === 'visible') cargarSiHaceFalta()
+    }
+    const socket: Socket = getSocket(token)
+
+    ultimaCargaEn = Date.now()
     cargar()
-    const intervalo = setInterval(cargar, 60000)
-    return () => { cancelado = true; clearInterval(intervalo) }
+    socket.on('connect', cargarSiHaceFalta)
+    document.addEventListener('visibilitychange', alVolverALaPestana)
+    window.addEventListener('online', cargarSiHaceFalta)
+    // El aviso de "llegó la hora de un pedido agendado" SÍ se atiende siempre.
+    window.addEventListener(EVENTO_REFRESCAR_PEDIDOS, cargar)
+    return () => {
+      cancelado = true
+      socket.off('connect', cargarSiHaceFalta)
+      document.removeEventListener('visibilitychange', alVolverALaPestana)
+      window.removeEventListener('online', cargarSiHaceFalta)
+      window.removeEventListener(EVENTO_REFRESCAR_PEDIDOS, cargar)
+    }
   }, [token])
 
   const clearOrders = useCallback(() => setOrders([]), [])
